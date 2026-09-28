@@ -187,14 +187,8 @@ export function getStats(instance: CodeGraphInstance) {
   return stats;
 }
 
-/**
- * 关闭索引（释放 SQLite 连接）。
- */
+/** 关闭索引并释放 SQLite 连接；失败必须由调用方处理。 */
 export function closeIndex(instance: CodeGraphInstance): void {
   log.info("closeIndex", { projectRoot: instance.projectRoot });
-  try {
-    instance.cg.close?.();
-  } catch {
-    // best-effort
-  }
+  instance.cg.close?.();
 }

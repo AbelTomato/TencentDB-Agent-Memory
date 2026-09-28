@@ -20,6 +20,7 @@ function fixture(status: "pending" | "processing" | "failed" | "ready") {
   const row = {
     service_id: "svc-1", team_id: "team-1", code_graph_id: "cg-1",
     status, internal_status: status === "processing" ? "promoting" : null,
+    has_last_good: true,
     last_sync_at: "2026-01-01T00:00:00Z", sync_error: null,
   } as CodeGraphRow;
   const store = {
@@ -37,7 +38,7 @@ function fixture(status: "pending" | "processing" | "failed" | "ready") {
 describe("restart recovery", () => {
   it("rolls back an uncommitted promotion and makes the last-good index ready", () => {
     const f = fixture("processing");
-    const candidate = join(f.root, "svc-1", "team-1", ".cg-1.candidate-orphan");
+    const candidate = join(f.root, "svc-1", "team-1", ".cg-1.candidate-00000000-0000-4000-8000-000000000001");
     mkdirSync(candidate);
 
     expect(recoverInterruptedCodeGraphs(f.store, f.root)).toBe(1);
@@ -94,5 +95,21 @@ describe("restart recovery", () => {
 
     expect(recoverInterruptedCodeGraphs(f.store, f.root)).toBe(0);
     expect(f.row.status).toBe("failed");
+  });
+
+  it("removes a candidate even when its asset row was deleted before a crash", () => {
+    const f = fixture("ready");
+    const orphan = join(f.root, "svc-1", "team-1", ".cg-deleted.candidate-00000000-0000-4000-8000-000000000002");
+    mkdirSync(orphan);
+    const noRows = {
+      listRecoverableCodeGraphs: () => [],
+      listSyncedCodeGraphs: () => [],
+      updateCodeGraphStatus: () => {},
+    } as unknown as Pick<IKnowledgeStore,
+      "listRecoverableCodeGraphs" | "listSyncedCodeGraphs" | "updateCodeGraphStatus"
+    >;
+
+    expect(recoverInterruptedCodeGraphs(noRows, f.root)).toBe(0);
+    expect(existsSync(orphan)).toBe(false);
   });
 });

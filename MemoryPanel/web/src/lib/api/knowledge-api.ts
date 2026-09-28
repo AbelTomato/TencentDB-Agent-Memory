@@ -23,6 +23,7 @@ interface Envelope<T = unknown> {
   code: number;
   message: string;
   request_id: string;
+  error_code?: string;
   data: T;
 }
 
@@ -30,13 +31,15 @@ export class KnowledgeApiError extends Error {
   code: number;
   requestId: string;
   rawMessage: string;
+  errorCode?: string;
 
-  constructor(code: number, message: string, requestId: string) {
+  constructor(code: number, message: string, requestId: string, errorCode?: string) {
     super(formatApiErrorMessage({ code, message, requestId }));
     this.name = 'KnowledgeApiError';
     this.code = code;
     this.requestId = requestId;
     this.rawMessage = message;
+    this.errorCode = errorCode;
   }
 }
 
@@ -62,7 +65,10 @@ async function panelPost<T>(path: string, body?: unknown): Promise<T> {
     throw new KnowledgeApiError(res.status || 500, text || res.statusText || 'Knowledge request failed', '');
   }
   if (!res.ok || env.code !== 0) {
-    throw new KnowledgeApiError(env.code ?? res.status, env.message || res.statusText, env.request_id);
+    throw new KnowledgeApiError(
+      env.code ?? res.status, env.message || res.statusText, env.request_id,
+      typeof env.error_code === 'string' ? env.error_code : undefined,
+    );
   }
   return env.data;
 }

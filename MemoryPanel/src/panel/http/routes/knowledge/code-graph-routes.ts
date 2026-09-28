@@ -176,7 +176,7 @@ export function registerKnowledgeCodeGraphRoutes(api: Hono, deps: PanelDeps): vo
     });
   });
 
-  // C7 search — id-only
+  // C7 search — id-only; before meta registration, only KS owner + team member may query.
   api.post('/knowledge/code-graph/search', mw, async (c) => {
     const ctx = buildCtx(c);
     const body = await readJson(c);
@@ -184,7 +184,7 @@ export function registerKnowledgeCodeGraphRoutes(api: Hono, deps: PanelDeps): vo
     const query = str(body, 'query');
     if (!cgId) return respondControlError(c, 400, 'MISSING_CODE_GRAPH_ID');
     if (!query) return respondControlError(c, 400, 'MISSING_QUERY');
-    const gate = await requireKnowledgeRead(deps, c, ctx, cgId);
+    const gate = await requireKnowledgeRead(deps, c, ctx, cgId, { allowInFlightCodeOwner: true });
     if ('error' in gate) return gate.error;
     const params: Record<string, unknown> = { query };
     if (str(body, 'kind')) params.kind = str(body, 'kind');
@@ -193,7 +193,7 @@ export function registerKnowledgeCodeGraphRoutes(api: Hono, deps: PanelDeps): vo
     return runKs(c, () => kc.codeGraphQuery(cgId, 'search', params));
   });
 
-  // C8 explore — id-only
+  // C8 explore — same owner fallback as search while the first build has no meta.
   api.post('/knowledge/code-graph/explore', mw, async (c) => {
     const ctx = buildCtx(c);
     const body = await readJson(c);
@@ -201,7 +201,7 @@ export function registerKnowledgeCodeGraphRoutes(api: Hono, deps: PanelDeps): vo
     const query = str(body, 'query');
     if (!cgId) return respondControlError(c, 400, 'MISSING_CODE_GRAPH_ID');
     if (!query) return respondControlError(c, 400, 'MISSING_QUERY');
-    const gate = await requireKnowledgeRead(deps, c, ctx, cgId);
+    const gate = await requireKnowledgeRead(deps, c, ctx, cgId, { allowInFlightCodeOwner: true });
     if ('error' in gate) return gate.error;
     const params: Record<string, unknown> = { query };
     if (typeof body.maxFiles === 'number') params.maxFiles = body.maxFiles;

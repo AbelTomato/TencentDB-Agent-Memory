@@ -9,6 +9,8 @@
  *     owner_user_key 走 ForCaller 路径（caller===owner）。失败 best-effort，
  *     前端 register-meta 兜底（幂等）。
  *   - status=failed → 不写明细、不写 meta（资源不可注入，UI 读 KS status 显示失败）。
+ *   - event=refresh_failed → 旧 CodeGraph 索引仍可服务，只记录刷新失败；
+ *     不把这次失败当作新的 ready ingest 重写内核明细或注册 meta。
  *
  * 用 payload.service_id 从注册表解析实例凭证（endpoint + api_key）→ 组 S2S 凭证
  * → 取 KS 详情 → POST /v3/knowledge/create。
@@ -29,7 +31,7 @@ interface CallbackBody {
   sync_error?: string | null;
   timestamp?: string;
   /** 细粒度 ingest 进度（与终态 status 回调共用 endpoint） */
-  event?: 'ingest_progress';
+  event?: 'ingest_progress' | 'refresh_failed';
   wiki_id?: string;
   team_id?: string;
   /** 单次 ingest 代际；与 progress / 终态共用，防 clear 后迟到包 */
@@ -155,6 +157,15 @@ export function registerKnowledgeCallbackRoutes(api: Hono, deps: PanelDeps): voi
         knowledge_id: body.knowledge_id, type: body.type, status: body.status,
       });
       return c.json({ code: 400, message: 'knowledge_id, type, status are required', request_id: '', data: null }, 400);
+    }
+    if (body.event === 'refresh_failed') {
+      if (body.type !== 'code-graph' || body.status !== 'ready') {
+        return c.json({ code: 400, message: 'refresh_failed requires ready code-graph', request_id: '', data: null }, 400);
+      }
+      log.warn('[knowledge-callback] code-graph refresh failed; keeping prior entity/meta', {
+        knowledge_id: body.knowledge_id, service_id: body.service_id, sync_error: body.sync_error,
+      });
+      return c.json({ code: 0, message: 'ok', request_id: '', data: null });
     }
     log.info('[knowledge-callback] received', {
       knowledge_id: body.knowledge_id,

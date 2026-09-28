@@ -13,7 +13,7 @@
  *   - Status state machine + restart recovery.
  */
 
-import { eq, and, isNull, isNotNull, desc, sql, type SQL } from "drizzle-orm";
+import { eq, and, inArray, isNull, desc, sql, type SQL } from "drizzle-orm";
 import type { Db } from "../db/client.js";
 import {
   knowledgeCodeGraph,
@@ -213,6 +213,7 @@ export class SqliteKnowledgeStore implements IKnowledgeStore {
     if (patch.service_url !== undefined) set.serviceUrl = patch.service_url;
     if (patch.summary !== undefined) set.summary = patch.summary;
     if (patch.version !== undefined) set.version = patch.version;
+    if (patch.has_last_good !== undefined) set.hasLastGood = patch.has_last_good;
 
     this.db
       .update(knowledgeCodeGraph)
@@ -224,6 +225,29 @@ export class SqliteKnowledgeStore implements IKnowledgeStore {
         ),
       )
       .run();
+  }
+
+  /** One SQLite UPDATE is the admission point shared by all service instances. */
+  tryAdmitCodeGraphSync(serviceId: string, teamId: string, codeGraphId: string, expectedVersion: number): boolean {
+    const result = this.db
+      .update(knowledgeCodeGraph)
+      .set({
+        status: "pending",
+        internalStatus: null,
+        syncError: null,
+        version: sql`${knowledgeCodeGraph.version} + 1`,
+        updatedAt: nowIso(),
+      })
+      .where(and(
+        eq(knowledgeCodeGraph.codeGraphId, codeGraphId),
+        eq(knowledgeCodeGraph.serviceId, serviceId),
+        eq(knowledgeCodeGraph.teamId, teamId),
+        isNull(knowledgeCodeGraph.deletedAt),
+        inArray(knowledgeCodeGraph.status, ["ready", "failed"]),
+        eq(knowledgeCodeGraph.version, expectedVersion),
+      ))
+      .run();
+    return result.changes === 1;
   }
 
   /** Hard delete; memory/team mismatch returns false. */
@@ -545,7 +569,7 @@ export class SqliteKnowledgeStore implements IKnowledgeStore {
       .from(knowledgeCodeGraph)
       .where(and(
         sql`status IN ('pending','processing','failed')`,
-        isNotNull(knowledgeCodeGraph.lastSyncAt),
+        eq(knowledgeCodeGraph.hasLastGood, true),
         isNull(knowledgeCodeGraph.deletedAt),
       ))
       .all()
@@ -627,6 +651,7 @@ export class SqliteKnowledgeStore implements IKnowledgeStore {
       service_url: r.serviceUrl ?? null,
       summary: r.summary ?? null,
       version: r.version,
+      has_last_good: r.hasLastGood,
       last_sync_at: r.lastSyncAt,
       created_at: r.createdAt,
       updated_at: r.updatedAt,

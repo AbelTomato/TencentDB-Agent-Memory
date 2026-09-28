@@ -9,8 +9,8 @@ import type { Context } from 'hono';
 import type { PanelDeps } from '../../../panel-deps.js';
 import { toKernelCredentials, type MetaCallContext } from '../../../kernel/types.js';
 import type { MetaEnvelope } from '../../../kernel/envelope.js';
-import { DomainError } from '../../../domain/errors.js';
-import { respondControlError, respondEnvelope } from '../../envelope.js';
+import { CoreUpstreamError, DomainError } from '../../../domain/errors.js';
+import { controlEnvelope, respondControlError, respondEnvelope } from '../../envelope.js';
 
 export function buildCtx(c: Context): MetaCallContext {
   const panelMeta = c.get('panelMeta');
@@ -133,6 +133,13 @@ export async function runKs<T>(
     const data = await fn();
     return respondEnvelope(c, okEnvelope(c, data));
   } catch (err) {
+    if (err instanceof CoreUpstreamError && err.upstreamErrorCode) {
+      const envelope = {
+        ...controlEnvelope(err.httpStatus, err.message || err.code, c.get('reqId') ?? ''),
+        error_code: err.upstreamErrorCode,
+      };
+      return respondEnvelope(c, envelope);
+    }
     if (err instanceof DomainError) {
       return respondControlError(c, err.httpStatus, err.message || err.code);
     }
@@ -333,7 +340,7 @@ export async function checkAssetReadPermission(
 
 /**
  * 知识资源读门控：meta asset 存在时走 acl/check；
- * code-graph 构建中无 meta 时，仅允许 KS owner 读 get（窄例外）。
+ * code-graph 尚无 meta 时，仅允许同 team 的 KS owner 走显式 opt-in 例外。
  */
 export async function requireKnowledgeRead(
   deps: PanelDeps,
@@ -356,7 +363,9 @@ export async function requireKnowledgeRead(
     return { userId, asset };
   }
 
-  if (opts?.allowInFlightCodeOwner && (action === 'read' || action === 'write')) {
+  // Only a confirmed missing meta asset may use the KS owner fallback. A meta
+  // outage or permission error must not silently bypass the normal ACL path.
+  if (assetEnv.code === 404 && opts?.allowInFlightCodeOwner && (action === 'read' || action === 'write')) {
     try {
       const kc = deps.knowledgeClientFactory(ctx.instanceId);
       const detail = await kc.codeGraphGet(knowledgeId);

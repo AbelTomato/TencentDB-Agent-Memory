@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { mkdtempSync } from "node:fs";
+import { rename } from "node:fs/promises";
 
 import { createCodeGraphWorker } from "./code-graph-worker.js";
 import { PreservedCodeGraphError } from "./store/code-graph-service.js";
@@ -27,10 +28,14 @@ function fixture() {
 
   const oldInstance = { projectRoot: dir, cg: {}, handler: {} } as CodeGraphInstance;
   const instances = new Map([["cg-1", oldInstance]]);
+  const pause = vi.fn(async () => {});
+  const resume = vi.fn();
   const instancePool: CodeGraphInstancePool = {
     get: (id) => instances.get(id),
     set: (id, instance) => { instances.set(id, instance); },
     delete: (id) => { instances.delete(id); },
+    pause,
+    resume,
   };
 
   const fetcher = {
@@ -56,9 +61,10 @@ function fixture() {
     codeGraphId: "cg-1",
     serviceId: "svc-1",
     teamId: "team-1",
+    hadReadyIndex: true,
     setInternalStatus: vi.fn(),
   };
-  return { root, dir, oldInstance, instancePool, fetcher, openIndex, indexProject, syncIndex, closeIndex, worker, ctx };
+  return { root, dir, oldInstance, instancePool, pause, resume, fetcher, openIndex, indexProject, syncIndex, getStats, closeIndex, worker, ctx };
 }
 
 describe("existing CodeGraph refresh", () => {
@@ -74,8 +80,8 @@ describe("existing CodeGraph refresh", () => {
 
     expect(readFileSync(join(f.dir, ".git", "HEAD"), "utf8")).toBe("old-commit");
     expect(readFileSync(join(f.dir, ".codegraph", "index.db"), "utf8")).toBe("old-index");
-    expect(f.instancePool.get("cg-1")).toBe(f.oldInstance);
-    expect(f.closeIndex).not.toHaveBeenCalledWith(f.oldInstance);
+    expect(f.instancePool.get("cg-1")?.projectRoot).toBe(f.dir);
+    expect(f.closeIndex).toHaveBeenCalledWith(f.oldInstance);
     expect(readdirSync(f.root)).toEqual(["graph"]);
   });
 
@@ -88,8 +94,8 @@ describe("existing CodeGraph refresh", () => {
     await expect(f.worker(f.ctx)).rejects.toBeInstanceOf(PreservedCodeGraphError);
 
     expect(readFileSync(join(f.dir, ".codegraph", "index.db"), "utf8")).toBe("old-index");
-    expect(f.instancePool.get("cg-1")).toBe(f.oldInstance);
-    expect(f.closeIndex).not.toHaveBeenCalledWith(f.oldInstance);
+    expect(f.instancePool.get("cg-1")?.projectRoot).toBe(f.dir);
+    expect(f.closeIndex).toHaveBeenCalledWith(f.oldInstance);
     expect(readdirSync(f.root)).toEqual(["graph"]);
   });
 
@@ -149,12 +155,31 @@ describe("existing CodeGraph refresh", () => {
     expect(readdirSync(f.root)).toEqual(["graph"]);
   });
 
+  it("rolls back after promotion even when the metadata store stays unavailable", async () => {
+    const f = fixture();
+    f.fetcher.sync.mockImplementation(async (_url, _branch, path) => {
+      writeFileSync(join(path, ".git", "HEAD"), "new-commit");
+      return { localPath: path, version: "new-commit", sourceType: "git" };
+    });
+
+    const result = await f.worker(f.ctx);
+    f.ctx.setInternalStatus.mockImplementation(() => { throw new Error("metadata store unavailable"); });
+
+    await expect(result.rollback?.()).resolves.toBeUndefined();
+    expect(readFileSync(join(f.dir, ".git", "HEAD"), "utf8")).toBe("old-commit");
+    expect(readFileSync(join(f.dir, ".codegraph", "index.db"), "utf8")).toBe("old-index");
+    expect(f.instancePool.get("cg-1")?.projectRoot).toBe(f.dir);
+    expect(readdirSync(f.root)).toEqual(["graph"]);
+  });
+
   it("rolls back the previous index when reopening a promoted candidate fails", async () => {
     const f = fixture();
     f.fetcher.sync.mockResolvedValue({ localPath: f.dir, version: "new-commit", sourceType: "git" });
     let finalOpens = 0;
     f.openIndex.mockImplementation(async (path) => {
-      if (path === f.dir && finalOpens++ === 0) throw new Error("cannot open promoted index");
+      // First canonical open rehydrates the old index after copying. The next
+      // one opens the promoted candidate and should exercise rollback.
+      if (path === f.dir && finalOpens++ === 1) throw new Error("cannot open promoted index");
       return { projectRoot: path, cg: {}, handler: {} } as CodeGraphInstance;
     });
 
@@ -163,5 +188,80 @@ describe("existing CodeGraph refresh", () => {
     expect(readFileSync(join(f.dir, ".codegraph", "index.db"), "utf8")).toBe("old-index");
     expect(f.instancePool.get("cg-1")?.projectRoot).toBe(f.dir);
     expect(existsSync(`${f.dir}.previous`)).toBe(false);
+  });
+
+  it("restores the original directory if the second promotion rename fails", async () => {
+    const f = fixture();
+    f.fetcher.sync.mockResolvedValue({ localPath: f.dir, version: "new-commit", sourceType: "git" });
+    let renames = 0;
+    const renameDir = vi.fn(async (source: string, destination: string) => {
+      if (++renames === 2) throw new Error("candidate rename failed");
+      await rename(source, destination);
+    });
+    const worker = createCodeGraphWorker({
+      instancePool: f.instancePool,
+      resolveFetcher: () => f.fetcher,
+      indexOps: {
+        openIndex: f.openIndex,
+        indexProject: f.indexProject,
+        syncIndex: f.syncIndex,
+        getStats: f.getStats,
+        closeIndex: f.closeIndex,
+      },
+      renameDir,
+    });
+
+    await expect(worker(f.ctx)).rejects.toBeInstanceOf(PreservedCodeGraphError);
+    expect(renameDir).toHaveBeenCalledTimes(3);
+    expect(readFileSync(join(f.dir, ".git", "HEAD"), "utf8")).toBe("old-commit");
+    expect(readFileSync(join(f.dir, ".codegraph", "index.db"), "utf8")).toBe("old-index");
+    expect(existsSync(`${f.dir}.previous`)).toBe(false);
+    expect(readdirSync(f.root)).toEqual(["graph"]);
+  });
+
+  it("copies only after closing the old SQLite handle and omits transient lock files", async () => {
+    const f = fixture();
+    writeFileSync(join(f.dir, ".codegraph", "codegraph.lock"), "stale lock");
+    writeFileSync(join(f.dir, ".codegraph", "daemon.pid"), "123");
+    writeFileSync(join(f.dir, ".codegraph", "index.log"), "old log");
+    f.closeIndex.mockImplementation((instance) => {
+      if (instance === f.oldInstance) {
+        // Simulate a WAL checkpoint performed by CodeGraph.close().
+        writeFileSync(join(f.dir, ".codegraph", "index.db"), "checkpointed");
+      }
+    });
+    f.fetcher.sync.mockImplementation(async (_url, _branch, path) => {
+      expect(readFileSync(join(path, ".codegraph", "index.db"), "utf8")).toBe("checkpointed");
+      expect(existsSync(join(path, ".codegraph", "codegraph.lock"))).toBe(false);
+      expect(existsSync(join(path, ".codegraph", "daemon.pid"))).toBe(false);
+      expect(existsSync(join(path, ".codegraph", "index.log"))).toBe(false);
+      return { localPath: path, version: "new-commit", sourceType: "git" };
+    });
+
+    const result = await f.worker(f.ctx);
+
+    expect(f.ctx.setInternalStatus).toHaveBeenCalledWith("copying");
+    expect(f.closeIndex).toHaveBeenCalledWith(f.oldInstance);
+    expect(f.pause).toHaveBeenCalledTimes(2);
+    expect(f.resume).toHaveBeenCalledTimes(2);
+    expect(readFileSync(join(f.dir, ".codegraph", "index.db"), "utf8")).toBe("checkpointed");
+    await result.finalize?.();
+  });
+
+  it("waits for query leases to drain before closing the old index", async () => {
+    const f = fixture();
+    let drain!: () => void;
+    f.pause.mockImplementationOnce(() => new Promise<void>((resolve) => { drain = resolve; }));
+    f.fetcher.sync.mockResolvedValue({ localPath: f.dir, version: "new-commit", sourceType: "git" });
+
+    const pending = f.worker(f.ctx);
+    await vi.waitFor(() => expect(f.pause).toHaveBeenCalledOnce());
+    expect(f.ctx.setInternalStatus).toHaveBeenCalledWith("copying");
+    expect(f.closeIndex).not.toHaveBeenCalledWith(f.oldInstance);
+    drain();
+
+    const result = await pending;
+    expect(f.closeIndex).toHaveBeenCalledWith(f.oldInstance);
+    await result.finalize?.();
   });
 });

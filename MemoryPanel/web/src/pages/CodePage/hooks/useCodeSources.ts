@@ -9,6 +9,7 @@ import { useTeams, useAgents } from '@/services';
 import { readAuth } from '@/components/LoginGate';
 import { tea } from '@/lib/tea-bridge';
 import { isValidGitHttpUrl, formatRepoName, type ScopeTab, type StatusFilter, type SubView, type ViewMode } from '../constants/code-constants';
+import { codeGraphQueryFailureMessage } from './code-query-error';
 
 export function useCodeSources() {
   const { t } = useTranslation();
@@ -351,7 +352,7 @@ export function useCodeSources() {
       setSearchResult(res?.text || JSON.stringify(res, null, 2));
     } catch (e: unknown) {
       setSearchResult('');
-      tea.notify.error(e);
+      tea.notify.error(codeGraphQueryFailureMessage(e, t) ?? e);
     } finally {
       setSearching(false);
     }
@@ -366,7 +367,7 @@ export function useCodeSources() {
       setExploreResult(res?.text || JSON.stringify(res, null, 2));
     } catch (e: unknown) {
       setExploreResult('');
-      tea.notify.error(e);
+      tea.notify.error(codeGraphQueryFailureMessage(e, t) ?? e);
     } finally {
       setExploring(false);
     }

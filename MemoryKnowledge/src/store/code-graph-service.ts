@@ -3,7 +3,7 @@
  *
  * 把 IKnowledgeStore（元数据/状态）+ BuildQueue（后台串行）+ 可注入的
  * worker（实际 git clone + codegraph 建图）粘合，实现：
- *   - create/sync 立即返回（fire-and-forget），管控轮询 status；
+ *   - create 入队后立即返回；sync 完成准入和陈旧快照清理后返回，管控轮询 status；
  *   - 状态机 pending → processing(cloning/indexing) → ready / failed(+sync_error)；
  *   - memory + team 隔离、幂等（同 memory+team+repo+branch 返回已存在）、硬删 + 四类资源清理。
  *
@@ -17,8 +17,9 @@
  * 物理目录：{dataRoot}/{service_id}/{team_id}/{code_graph_id}/（001 多租户）。
  */
 
-import { join } from "node:path";
-import { rmSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
+import { readdirSync, rmSync } from "node:fs";
+import { rm } from "node:fs/promises";
 
 import type {
   AuditAction,
@@ -37,6 +38,8 @@ export interface CodeGraphBuildContext {
   branch: string;
   /** 该资产的本地工作目录（checkout + 索引落此）。 */
   dir: string;
+  /** The admitted row was ready, so a committed last-good index should exist. */
+  hadReadyIndex: boolean;
   /** worker 可调用以更新细粒度内部状态（cloning → indexing）。 */
   setInternalStatus: (s: string) => void;
 }
@@ -65,11 +68,13 @@ export class PreservedCodeGraphError extends Error {
  *   - ok       已入队重建；
  *   - not_found memory/team/id 不匹配；
  *   - busy     正在 pending/processing（并发拒绝，对应 HTTP 409），step 为内部阶段（可 null）。
+ *   - conflict CAS 未获准但竞争方已完成或修改状态（对应 HTTP 409）。
  */
 export type SyncResult =
   | { kind: "ok"; row: CodeGraphRow }
   | { kind: "not_found" }
-  | { kind: "busy"; status: "pending" | "processing"; step: string | null };
+  | { kind: "busy"; status: "pending" | "processing"; step: string | null }
+  | { kind: "conflict" };
 
 export interface CodeGraphServiceLogger {
   info?: (msg: string) => void;
@@ -162,30 +167,42 @@ export class CodeGraphService {
   }
 
   /** 重新拉取 + 重建（管控显式触发）。memory/team 不匹配返回 not_found；pending/processing 返回 busy。 */
-  sync(serviceId: string, teamId: string, codeGraphId: string, requesterUserId?: string): SyncResult {
+  async sync(serviceId: string, teamId: string, codeGraphId: string, requesterUserId?: string): Promise<SyncResult> {
     const row = this.store.getCodeGraph(serviceId, teamId, codeGraphId);
     if (!row) return { kind: "not_found" };
     // 并发拒绝：正在排队/执行中直接拒绝，不覆盖状态、不重复入队、不写 audit。
     if (row.status === "pending" || row.status === "processing") {
       return { kind: "busy", status: row.status, step: row.internal_status };
     }
-    // A committed refresh may have left its retired snapshot behind if cleanup
-    // failed. Remove it while the row is still ready; otherwise restart recovery
-    // could mistake it for an uncommitted promotion after we enter pending.
-    if (row.status === "ready") {
-      rmSync(`${this.dirFor(serviceId, teamId, codeGraphId)}.previous`, { recursive: true, force: true });
+    const hadReadyIndex = row.status === "ready" && row.has_last_good;
+    const observedVersion = row.version;
+    // The admission must be atomic across separate services sharing this store.
+    // A losing caller never touches .previous, audits, or enqueues a worker.
+    if (!this.store.tryAdmitCodeGraphSync(serviceId, teamId, codeGraphId, observedVersion)) {
+      const current = this.store.getCodeGraph(serviceId, teamId, codeGraphId);
+      if (!current) return { kind: "not_found" };
+      if (current.status === "pending" || current.status === "processing") {
+        return { kind: "busy", status: current.status, step: current.internal_status };
+      }
+      return { kind: "conflict" };
     }
-    const nextVersion = row.version + 1;
-    this.store.updateCodeGraphStatus(serviceId, codeGraphId, {
-      status: "pending",
-      internal_status: null,
-      sync_error: null,
-      version: nextVersion,
-    });
-    this.audit({ ...row, version: nextVersion }, "ingest", "manual sync", requesterUserId);
+
+    // A committed refresh may leave a retired snapshot if finalize failed. Do
+    // this after admission so another service cannot delete this worker's backup.
+    // Failure is best-effort: the worker validates any leftover backup.
+    if (hadReadyIndex) {
+      try {
+        await rm(`${this.dirFor(serviceId, teamId, codeGraphId)}.previous`, { recursive: true, force: true });
+      } catch (err) {
+        this.logger?.warn?.(`[code-graph] rm previous dir failed ${codeGraphId}: ${String(err)}`);
+      }
+    }
     const fresh = this.store.getCodeGraph(serviceId, teamId, codeGraphId);
-    if (fresh) this.enqueueBuild(fresh);
-    return fresh ? { kind: "ok", row: fresh } : { kind: "not_found" };
+    if (!fresh) return { kind: "not_found" };
+    if (fresh.status !== "pending" || fresh.version !== observedVersion + 1) return { kind: "conflict" };
+    this.audit(fresh, "ingest", "manual sync", requesterUserId);
+    this.enqueueBuild(fresh, hadReadyIndex);
+    return { kind: "ok", row: fresh };
   }
 
   get(serviceId: string, teamId: string, codeGraphId: string): CodeGraphRow | null {
@@ -260,6 +277,20 @@ export class CodeGraphService {
     } catch (err) {
       this.logger?.warn?.(`[code-graph] rm previous dir failed ${codeGraphId}: ${String(err)}`);
     }
+    const assetDir = this.dirFor(serviceId, teamId, codeGraphId);
+    try {
+      const parent = dirname(assetDir);
+      const prefix = `.${basename(assetDir)}.candidate-`;
+      for (const entry of readdirSync(parent, { withFileTypes: true })) {
+        if (!entry.isDirectory() || !entry.name.startsWith(prefix)) continue;
+        try { rmSync(join(parent, entry.name), { recursive: true, force: true }); }
+        catch (err) { this.logger?.warn?.(`[code-graph] rm candidate dir failed ${codeGraphId}: ${String(err)}`); }
+      }
+    } catch (err) {
+      if (!(err instanceof Error && "code" in err && err.code === "ENOENT")) {
+        this.logger?.warn?.(`[code-graph] scan candidate dirs failed ${codeGraphId}: ${String(err)}`);
+      }
+    }
   }
 
   /**
@@ -289,9 +320,9 @@ export class CodeGraphService {
     }
   }
 
-  private enqueueBuild(row: CodeGraphRow): void {
+  private enqueueBuild(row: CodeGraphRow, hadReadyIndex = false): void {
     this.queue.enqueue(row.code_graph_id, () =>
-      this.runBuild(row.service_id, row.code_graph_id, row.team_id, row.repo_url, row.branch),
+      this.runBuild(row.service_id, row.code_graph_id, row.team_id, row.repo_url, row.branch, hadReadyIndex),
     );
   }
 
@@ -301,15 +332,13 @@ export class CodeGraphService {
     teamId: string,
     repoUrl: string,
     branch: string,
+    hadReadyIndex: boolean,
   ): Promise<void> {
     // 入口检查点：pending 期间被删 → 直接跳过，不置 processing、不建图。
     if (this.isDeleted(serviceId, codeGraphId)) {
       this.finishCancelled(serviceId, teamId, codeGraphId);
       return;
     }
-    // sync() has already moved a ready row to pending. A prior successful build
-    // is distinguishable from a first build by its committed last_sync_at.
-    const hadReadyIndex = this.store.getCodeGraphById(serviceId, codeGraphId)?.last_sync_at != null;
     this.store.updateCodeGraphStatus(serviceId, codeGraphId, {
       status: "processing",
       internal_status: "cloning",
@@ -325,6 +354,7 @@ export class CodeGraphService {
         repoUrl,
         branch,
         dir: this.dirFor(serviceId, teamId, codeGraphId),
+        hadReadyIndex,
         setInternalStatus: (s) =>
           this.store.updateCodeGraphStatus(serviceId, codeGraphId, { status: "processing", internal_status: s }),
       });
@@ -339,6 +369,7 @@ export class CodeGraphService {
         sync_error: null,
         commit_hash: result.commitHash ?? null,
         stats_json: result.stats ? JSON.stringify(result.stats) : null,
+        has_last_good: true,
         last_sync_at: new Date().toISOString(),
       });
       committed = true;
@@ -378,13 +409,13 @@ export class CodeGraphService {
         internal_status: null,
         sync_error: msg.slice(0, 500),
       });
-      const failed = this.store.getCodeGraphById(serviceId, codeGraphId);
-      if (failed) this.audit(failed, "failed", msg.slice(0, 500));
+      const rowAfterRefresh = this.store.getCodeGraphById(serviceId, codeGraphId);
+      if (rowAfterRefresh) this.audit(rowAfterRefresh, preserved ? "refresh_failed" : "failed", msg.slice(0, 500));
       this.logger?.warn?.(`[code-graph] ${codeGraphId} refresh failed${preserved ? " (previous index retained)" : ""}: ${msg}`);
 
       // TMC should see the same serving status as the store. Do not replace the
       // last successful summary with one computed from missing refresh stats.
-      await this.onBuildComplete(failed, preserved ? "ready" : "failed", msg, null, !preserved);
+      await this.onBuildComplete(rowAfterRefresh, preserved ? "ready" : "failed", msg, null, !preserved, preserved ? "refresh_failed" : undefined);
     }
   }
 
@@ -408,6 +439,7 @@ export class CodeGraphService {
     errorMsg: string | null,
     stats: { files: number; nodes: number; edges: number } | null,
     generateSummary = true,
+    event?: "refresh_failed",
   ): Promise<void> {
     if (!row || !this.callbackConfig) return;
 
@@ -435,6 +467,7 @@ export class CodeGraphService {
         summary,
         sync_error: errorMsg?.slice(0, 500) ?? null,
         timestamp: new Date().toISOString(),
+        ...(event ? { event } : {}),
       },
       this.callbackConfig,
     );

@@ -1,7 +1,7 @@
 /** Restore the previous index when a process stopped during a refresh. */
 
 import { existsSync, readdirSync, renameSync, rmSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { join } from "node:path";
 
 import type { IKnowledgeStore } from "./store/types.js";
 
@@ -16,6 +16,9 @@ export function recoverInterruptedCodeGraphs(
 ): number {
   let recovered = 0;
   for (const row of store.listRecoverableCodeGraphs()) {
+    // The persisted bit survives a crash and does not depend on a timestamp
+    // that older ready rows may lack.
+    if (!row.has_last_good) continue;
     const dir = join(dataDir, row.service_id, row.team_id, row.code_graph_id);
     const previousDir = `${dir}.previous`;
     try {
@@ -43,17 +46,6 @@ export function recoverInterruptedCodeGraphs(
       });
       recovered++;
 
-      // A crash while building can leave large, unused candidate directories.
-      try {
-        const candidatePrefix = `.${basename(dir)}.candidate-`;
-        for (const entry of readdirSync(dirname(dir))) {
-          if (entry.startsWith(candidatePrefix)) {
-            rmSync(join(dirname(dir), entry), { recursive: true, force: true });
-          }
-        }
-      } catch (err) {
-        logger?.warn(`[code-graph] could not remove candidate for ${row.code_graph_id}: ${String(err)}`);
-      }
     } catch (err) {
       logger?.warn(`[code-graph] could not restore interrupted refresh ${row.code_graph_id}: ${String(err)}`);
       // Leave the row unchanged; the regular sweep handles pending/processing.
@@ -69,5 +61,33 @@ export function recoverInterruptedCodeGraphs(
     try { rmSync(previousDir, { recursive: true, force: true }); }
     catch (err) { logger?.warn(`[code-graph] could not remove retired index ${ref.code_graph_id}: ${String(err)}`); }
   }
+  // A delete can remove the metadata row before a crash, so a row-based sweep
+  // alone misses its candidate. Recovery runs before this process starts jobs.
+  cleanupOrphanCandidates(dataDir, logger);
   return recovered;
+}
+
+function cleanupOrphanCandidates(dataDir: string, logger?: { warn: (message: string) => void }): void {
+  if (!existsSync(dataDir)) return;
+  try {
+    for (const service of readdirSync(dataDir, { withFileTypes: true })) {
+      if (!service.isDirectory()) continue;
+      const serviceDir = join(dataDir, service.name);
+      for (const team of readdirSync(serviceDir, { withFileTypes: true })) {
+        if (!team.isDirectory()) continue;
+        const teamDir = join(serviceDir, team.name);
+        try {
+          for (const entry of readdirSync(teamDir, { withFileTypes: true })) {
+            if (!/^\.cg-[0-9a-z]+\.candidate-[0-9a-f-]{36}$/.test(entry.name)) continue;
+            try { rmSync(join(teamDir, entry.name), { recursive: true, force: true }); }
+            catch (err) { logger?.warn(`[code-graph] could not remove orphan candidate ${entry.name}: ${String(err)}`); }
+          }
+        } catch (err) {
+          logger?.warn(`[code-graph] could not scan candidates in ${teamDir}: ${String(err)}`);
+        }
+      }
+    }
+  } catch (err) {
+    logger?.warn(`[code-graph] could not scan candidates in ${dataDir}: ${String(err)}`);
+  }
 }

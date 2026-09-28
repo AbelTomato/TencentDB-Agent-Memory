@@ -3,7 +3,7 @@
 import { randomUUID } from "node:crypto";
 import { constants, existsSync, mkdirSync } from "node:fs";
 import { cp, rename, rm } from "node:fs/promises";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, relative, sep } from "node:path";
 
 import { closeIndex, getStats, indexProject, openIndex, syncIndex, type CodeGraphInstance } from "./engines/code/index.js";
 import { PreservedCodeGraphError, type CodeGraphWorker } from "./store/code-graph-service.js";
@@ -29,6 +29,7 @@ export interface CodeGraphWorkerOptions {
   instancePool: CodeGraphInstancePool;
   resolveFetcher: (repoUrl: string) => ISourceFetcher;
   indexOps?: CodeGraphIndexOps;
+  renameDir?: typeof rename;
   logger?: { warn: (message: string) => void };
 }
 
@@ -46,12 +47,15 @@ function statsFor(instance: CodeGraphInstance, indexOps: CodeGraphIndexOps) {
 export function createCodeGraphWorker(options: CodeGraphWorkerOptions): CodeGraphWorker {
   const { instancePool, resolveFetcher, logger } = options;
   const indexOps = options.indexOps ?? defaultIndexOps;
+  const renameDir = options.renameDir ?? rename;
 
-  return async ({ dir, repoUrl, branch, codeGraphId, setInternalStatus }) => {
+  return async ({ dir, repoUrl, branch, codeGraphId, hadReadyIndex, setInternalStatus }) => {
     const fetcher = resolveFetcher(repoUrl);
 
     // There is no last-good version to preserve on the first build.
-    if (!existsSync(join(dir, ".git"))) {
+    if (!hadReadyIndex) {
+      // A failed initial build may have left a partial checkout behind.
+      await rm(dir, { recursive: true, force: true });
       mkdirSync(dir, { recursive: true });
       setInternalStatus("cloning");
       const result = await fetcher.fetch(repoUrl, branch, dir);
@@ -70,20 +74,51 @@ export function createCodeGraphWorker(options: CodeGraphWorkerOptions): CodeGrap
     let candidateInstance: CodeGraphInstance | undefined;
     let oldIntact = true;
 
+    // Stop new reads and wait for in-flight reads before closing SQLite. The
+    // CodeGraph engine checkpoints WAL on close; only then is a file copy of
+    // codegraph.db and its sidecars a consistent source for the candidate.
+    const withPausedIndex = async <T>(phase: string | undefined, action: () => Promise<T>): Promise<T> => {
+      // Rollback must work even when the metadata store is the failed component.
+      if (phase) setInternalStatus(phase);
+      try {
+        await instancePool.pause?.(codeGraphId);
+        return await action();
+      }
+      finally { instancePool.resume?.(codeGraphId); }
+    };
+
     try {
       if (existsSync(backupDir)) {
-        // The canonical directory might be a candidate from a failed rollback.
-        // Neither a pool handle nor .git proves that the last-good index survived.
-        oldIntact = false;
-        throw new Error(`unfinished CodeGraph promotion at ${backupDir}`);
+        // Admission came from ready, so this is a retired snapshot whose
+        // previous finalize failed. If removal fails, leave canonical intact.
+        await rm(backupDir, { recursive: true, force: true });
       }
-      // Git reset/clean and CodeGraph sync both write in place. Copy-on-write where
-      // supported keeps those writes away from the version currently serving queries.
-      await cp(dir, candidateDir, { recursive: true, mode: constants.COPYFILE_FICLONE, verbatimSymlinks: true });
+      await withPausedIndex("copying", async () => {
+        // If the pool was not hydrated, open and close once to checkpoint WAL.
+        const oldInstance = instancePool.get(codeGraphId) ?? await indexOps.openIndex(dir);
+        try { indexOps.closeIndex(oldInstance); }
+        finally { instancePool.delete(codeGraphId); }
+        // Git reset/clean and CodeGraph sync both write in place. Copy-on-write
+        // where supported keeps those writes away from the serving checkout.
+        await cp(dir, candidateDir, {
+          recursive: true,
+          mode: constants.COPYFILE_FICLONE,
+          verbatimSymlinks: true,
+          filter: (source) => {
+            const parts = relative(dir, source).split(sep);
+            if (parts[0] !== ".codegraph" || parts.length < 2) return true;
+            const name = parts.at(-1) ?? "";
+            return name !== "codegraph.lock" && name !== "daemon.pid" && name !== "daemon.sock" && !name.endsWith(".log");
+          },
+        });
+        // Reopen promptly: network fetch and candidate indexing can take a long
+        // time, while queries can keep using the unchanged canonical index.
+        instancePool.set(codeGraphId, await indexOps.openIndex(dir));
+      });
+      setInternalStatus("fetching");
 
       let version: string | null;
       try {
-        setInternalStatus("fetching");
         const result = await fetcher.sync(repoUrl, branch, candidateDir);
         version = result.version;
         setInternalStatus("indexing");
@@ -108,33 +143,33 @@ export function createCodeGraphWorker(options: CodeGraphWorkerOptions): CodeGrap
       indexOps.closeIndex(candidateInstance);
       candidateInstance = undefined;
 
-      // Release SQLite handles before renaming directories (required on Windows).
-      // Query routes already gate processing assets, so no new query starts here.
-      setInternalStatus("promoting");
-      const oldInstance = instancePool.get(codeGraphId);
-      if (oldInstance) indexOps.closeIndex(oldInstance);
-      instancePool.delete(codeGraphId);
+      await withPausedIndex("promoting", async () => {
+        // Release SQLite handles before renaming directories (required on Windows).
+        const oldInstance = instancePool.get(codeGraphId);
+        try { if (oldInstance) indexOps.closeIndex(oldInstance); }
+        finally { instancePool.delete(codeGraphId); }
 
-      try {
-        await rename(dir, backupDir);
-        oldIntact = false;
-        await rename(candidateDir, dir);
-        const activeInstance = await indexOps.openIndex(dir);
-        instancePool.set(codeGraphId, activeInstance);
-      } catch (promotionError) {
         try {
-          if (existsSync(backupDir)) {
-            if (existsSync(dir)) await rm(dir, { recursive: true, force: true });
-            await rename(backupDir, dir);
-            oldIntact = true;
-          }
-          if (oldIntact) instancePool.set(codeGraphId, await indexOps.openIndex(dir));
-        } catch (restoreError) {
+          await renameDir(dir, backupDir);
           oldIntact = false;
-          throw new AggregateError([promotionError, restoreError], "CodeGraph promotion and rollback both failed");
+          await renameDir(candidateDir, dir);
+          const activeInstance = await indexOps.openIndex(dir);
+          instancePool.set(codeGraphId, activeInstance);
+        } catch (promotionError) {
+          try {
+            if (existsSync(backupDir)) {
+              if (existsSync(dir)) await rm(dir, { recursive: true, force: true });
+              await renameDir(backupDir, dir);
+              oldIntact = true;
+            }
+            if (oldIntact) instancePool.set(codeGraphId, await indexOps.openIndex(dir));
+          } catch (restoreError) {
+            oldIntact = false;
+            throw new AggregateError([promotionError, restoreError], "CodeGraph promotion and rollback both failed");
+          }
+          throw promotionError;
         }
-        throw promotionError;
-      }
+      });
 
       return {
         commitHash: version ?? undefined,
@@ -142,12 +177,14 @@ export function createCodeGraphWorker(options: CodeGraphWorkerOptions): CodeGrap
         // Keep the old snapshot until CodeGraphService commits the new status.
         finalize: () => rm(backupDir, { recursive: true, force: true }),
         rollback: async () => {
-          const activeInstance = instancePool.get(codeGraphId);
-          if (activeInstance) indexOps.closeIndex(activeInstance);
-          instancePool.delete(codeGraphId);
-          if (existsSync(dir)) await rm(dir, { recursive: true, force: true });
-          await rename(backupDir, dir);
-          instancePool.set(codeGraphId, await indexOps.openIndex(dir));
+          await withPausedIndex(undefined, async () => {
+            const activeInstance = instancePool.get(codeGraphId);
+            try { if (activeInstance) indexOps.closeIndex(activeInstance); }
+            finally { instancePool.delete(codeGraphId); }
+            if (existsSync(dir)) await rm(dir, { recursive: true, force: true });
+            await renameDir(backupDir, dir);
+            instancePool.set(codeGraphId, await indexOps.openIndex(dir));
+          });
         },
       };
     } catch (err) {
@@ -162,7 +199,10 @@ export function createCodeGraphWorker(options: CodeGraphWorkerOptions): CodeGrap
       }
       throw new PreservedCodeGraphError(err);
     } finally {
-      if (candidateInstance) indexOps.closeIndex(candidateInstance);
+      if (candidateInstance) {
+        try { indexOps.closeIndex(candidateInstance); }
+        catch (err) { logger?.warn(`[code-graph] could not close candidate for ${codeGraphId}: ${String(err)}`); }
+      }
       try { await rm(candidateDir, { recursive: true, force: true }); }
       catch (err) { logger?.warn(`[code-graph] could not remove candidate for ${codeGraphId}: ${String(err)}`); }
     }

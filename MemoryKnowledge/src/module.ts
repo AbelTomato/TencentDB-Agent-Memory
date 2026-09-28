@@ -54,7 +54,135 @@ export interface CodeGraphInstancePool {
   get(codeGraphId: string): CodeGraphInstance | undefined;
   set(codeGraphId: string, instance: CodeGraphInstance): void;
   delete(codeGraphId: string): void;
+  /** Hold a query lease until its handler has finished using the instance. */
+  acquire?(codeGraphId: string): { instance: CodeGraphInstance; release(): void } | undefined;
+  /** Stop new leases and lazy loads, then wait for existing ones to finish. */
+  pause?(codeGraphId: string): Promise<void>;
+  resume?(codeGraphId: string): void;
   loadIfMissing?(codeGraphId: string, dir: string): Promise<CodeGraphInstance | undefined>;
+}
+
+interface CodeGraphPoolIndexOps {
+  openIndex: (dir: string) => Promise<CodeGraphInstance>;
+  closeIndex: (instance: CodeGraphInstance) => void;
+}
+
+interface CodeGraphPoolGate {
+  pauses: number;
+  leases: number;
+  loads: number;
+  waiters: Array<{ resolve: () => void; reject: (error: unknown) => void }>;
+  /** A discarded handle could not be closed, so promotion cannot safely proceed. */
+  drainError?: unknown;
+}
+
+/** The production pool's lifecycle gate protects handles while a graph is promoted. */
+export function createCodeGraphInstancePool(
+  indexOps: CodeGraphPoolIndexOps = { openIndex, closeIndex },
+): Required<CodeGraphInstancePool> {
+  const instances = new Map<string, CodeGraphInstance>();
+  const loading = new Map<string, Promise<CodeGraphInstance | undefined>>();
+  const gates = new Map<string, CodeGraphPoolGate>();
+
+  function gate(id: string) {
+    let state = gates.get(id);
+    if (!state) {
+      state = { pauses: 0, leases: 0, loads: 0, waiters: [] };
+      gates.set(id, state);
+    }
+    return state;
+  }
+
+  function notifyIdle(state: CodeGraphPoolGate) {
+    if (state.leases !== 0 || state.loads !== 0) return;
+    for (const waiter of state.waiters.splice(0)) {
+      if (state.drainError !== undefined) waiter.reject(state.drainError);
+      else waiter.resolve();
+    }
+  }
+
+  function discard(state: CodeGraphPoolGate, instance: CodeGraphInstance) {
+    try { indexOps.closeIndex(instance); }
+    catch (err) {
+      state.drainError = err;
+      throw err;
+    }
+  }
+
+  return {
+    get(id) { return instances.get(id); },
+    set(id, instance) { instances.set(id, instance); },
+    delete(id) { instances.delete(id); },
+    acquire(id) {
+      const state = gate(id);
+      if (state.pauses > 0) return undefined;
+      const instance = instances.get(id);
+      if (!instance) return undefined;
+      state.leases++;
+      let released = false;
+      return {
+        instance,
+        release() {
+          if (released) return;
+          released = true;
+          state.leases--;
+          notifyIdle(state);
+        },
+      };
+    },
+    pause(id) {
+      const state = gate(id);
+      // Mark paused synchronously, before the caller's first await.
+      state.pauses++;
+      if (state.leases === 0 && state.loads === 0) {
+        return state.drainError !== undefined ? Promise.reject(state.drainError) : Promise.resolve();
+      }
+      return new Promise<void>((resolve, reject) => { state.waiters.push({ resolve, reject }); });
+    },
+    resume(id) {
+      const state = gate(id);
+      if (state.pauses > 0) state.pauses--;
+    },
+    async loadIfMissing(id, dir) {
+      const state = gate(id);
+      if (state.pauses > 0) return undefined;
+      const existing = instances.get(id);
+      if (existing) return existing;
+      const pending = loading.get(id);
+      if (pending) return pending;
+
+      state.loads++;
+      const opening = (async () => {
+        try {
+          let instance: CodeGraphInstance;
+          try { instance = await indexOps.openIndex(dir); }
+          catch (err) {
+            log.warn(`[code-graph] lazy-load failed ${id}: ${err instanceof Error ? err.message : String(err)}`);
+            return undefined;
+          }
+          if (state.pauses > 0) {
+            discard(state, instance);
+            return undefined;
+          }
+          // A worker can install a freshly promoted handle while lazy open runs.
+          const current = instances.get(id);
+          if (current) {
+            if (current !== instance) discard(state, instance);
+            return current;
+          }
+          instances.set(id, instance);
+          log.info(`[code-graph] lazy-loaded instance ${id}`);
+          return instance;
+        } finally {
+          loading.delete(id);
+          state.loads--;
+          notifyIdle(state);
+        }
+      })();
+      loading.set(id, opening);
+      return opening;
+    },
+  };
 }
 
 export interface KnowledgeModule {
@@ -91,24 +219,7 @@ export function createKnowledgeModule(config: KnowledgeModuleConfig): KnowledgeM
     resolveLlmConfig(serviceId, llmBindingStore.get(serviceId), llmConfig);
 
   // Instance pool (code-graph) — lazy loading
-  const _poolMap = new Map<string, CodeGraphInstance>();
-  const instancePool: CodeGraphInstancePool = {
-    get(id: string) { return _poolMap.get(id); },
-    set(id: string, inst: CodeGraphInstance) { _poolMap.set(id, inst); },
-    delete(id: string) { _poolMap.delete(id); },
-    async loadIfMissing(id: string, dir: string) {
-      if (_poolMap.has(id)) return _poolMap.get(id);
-      try {
-        const instance = await openIndex(dir);
-        _poolMap.set(id, instance);
-        log.info(`[code-graph] lazy-loaded instance ${id}`);
-        return instance;
-      } catch (err) {
-        log.warn(`[code-graph] lazy-load failed ${id}: ${err instanceof Error ? err.message : String(err)}`);
-        return undefined;
-      }
-    },
-  };
+  const instancePool = createCodeGraphInstancePool();
 
   // Wiki engine manager
   const wikiMgr = createWikiSourceManager(join(dataDir, "_wiki_engines"));
@@ -202,8 +313,8 @@ export function createKnowledgeModule(config: KnowledgeModuleConfig): KnowledgeM
       for (const row of allSynced) {
         const dir = join(dataDir, row.service_id, row.team_id, row.code_graph_id);
         try {
-          const instance = await openIndex(dir);
-          instancePool.set(row.code_graph_id, instance);
+          const instance = await instancePool.loadIfMissing(row.code_graph_id, dir);
+          if (!instance) continue;
           const rawStats = getStats(instance);
           if (rawStats) {
             const statsJson = JSON.stringify({
