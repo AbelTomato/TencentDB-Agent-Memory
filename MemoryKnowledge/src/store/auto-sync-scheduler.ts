@@ -24,7 +24,7 @@
  */
 
 import { createLogger } from "../logger.js";
-import type { CodeGraphService, SyncResult } from "./code-graph-service.js";
+import type { AutoSyncResult, CodeGraphService } from "./code-graph-service.js";
 import type { IKnowledgeStore, CodeGraphRow } from "./types.js";
 
 const log = createLogger("auto-sync-scheduler");
@@ -283,13 +283,19 @@ export class AutoSyncScheduler {
     log.info(`[auto-sync] sync ${row.code_graph_id} (${row.repo_url}@${row.branch})`);
     try {
       // Admission may await best-effort snapshot cleanup before enqueueing.
-      const result: SyncResult = await Promise.resolve(
-        this.cgService.sync(row.service_id, row.team_id, row.code_graph_id, undefined),
+      const result: AutoSyncResult = await Promise.resolve(
+        this.cgService.syncIfChanged(row.service_id, row.team_id, row.code_graph_id),
       );
       const durationMs = Date.now() - startMs;
       switch (result.kind) {
         case "ok":
           log.info(`[auto-sync] sync enqueued for ${row.code_graph_id} (took ${durationMs}ms)`);
+          break;
+        case "unchanged":
+          log.debug(`[auto-sync] unchanged ${row.code_graph_id} at ${result.revision} (took ${durationMs}ms)`);
+          break;
+        case "probe_failed":
+          log.warn(`[auto-sync] probe failed for ${row.code_graph_id} (${result.code}, retryable): ${result.message}`);
           break;
         case "busy":
           log.debug(`[auto-sync] skip ${row.code_graph_id}: already ${result.status} (step: ${result.step})`);

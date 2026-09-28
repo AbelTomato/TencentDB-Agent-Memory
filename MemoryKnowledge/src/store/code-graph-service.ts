@@ -76,6 +76,26 @@ export type SyncResult =
   | { kind: "busy"; status: "pending" | "processing"; step: string | null }
   | { kind: "conflict" };
 
+export type CodeGraphProbeFailureCode = "timeout" | "network" | "ref_not_found" | "remote_error";
+
+export type CodeGraphVersionProbeResult =
+  | { kind: "unchanged"; revision: string }
+  | { kind: "changed"; localRevision: string | null; remoteRevision: string }
+  | { kind: "refresh_required"; reason: string }
+  | { kind: "unsupported" }
+  | { kind: "failed"; code: CodeGraphProbeFailureCode; retryable: true; message: string };
+
+export type CodeGraphVersionProbe = (row: CodeGraphRow, dir: string) => Promise<CodeGraphVersionProbeResult>;
+
+export type AutoSyncResult =
+  | SyncResult
+  | { kind: "unchanged"; revision: string }
+  | { kind: "probe_failed"; code: CodeGraphProbeFailureCode; retryable: true; message: string };
+
+function formatProbeDiagnostic(code: CodeGraphProbeFailureCode, message: string): string {
+  return `[${code}] ${message}`;
+}
+
 export interface CodeGraphServiceLogger {
   info?: (msg: string) => void;
   warn?: (msg: string) => void;
@@ -97,6 +117,8 @@ export interface CodeGraphServiceOptions {
    * implementation must release its gate if it throws.
    */
   releaseInstance?: (codeGraphId: string) => Promise<(() => void) | null>;
+  /** Optional read-only probe used only by automatic sync. */
+  versionProbe?: CodeGraphVersionProbe;
 }
 
 export interface CreateCodeGraphParams {
@@ -120,6 +142,7 @@ export class CodeGraphService {
   private readonly logger?: CodeGraphServiceLogger;
   private readonly callbackConfig?: { tmcCallbackUrl: string };
   private readonly releaseInstance?: (codeGraphId: string) => Promise<(() => void) | null>;
+  private readonly versionProbe?: CodeGraphVersionProbe;
   /** An accepted delete rejects new sync until its metadata commit returns. */
   private readonly deleting = new Set<string>();
   /** A failed file removal may be retried only for an asset this service deleted. */
@@ -133,6 +156,7 @@ export class CodeGraphService {
     this.logger = opts.logger;
     this.callbackConfig = opts.callbackConfig;
     this.releaseInstance = opts.releaseInstance;
+    this.versionProbe = opts.versionProbe;
   }
 
   dirFor(serviceId: string, teamId: string, codeGraphId: string): string {
@@ -169,7 +193,79 @@ export class CodeGraphService {
     if (this.deleting.has(codeGraphId)) return { kind: "conflict" };
     const row = this.store.getCodeGraph(serviceId, teamId, codeGraphId);
     if (!row) return { kind: "not_found" };
+    return this.admitSync(row, "manual sync", requesterUserId);
+  }
+
+  /** Automatic refresh: probe a committed ready build before admitting filesystem work. */
+  async syncIfChanged(serviceId: string, teamId: string, codeGraphId: string): Promise<AutoSyncResult> {
+    if (this.deleting.has(codeGraphId)) return { kind: "conflict" };
+    const row = this.store.getCodeGraph(serviceId, teamId, codeGraphId);
+    if (!row) return { kind: "not_found" };
     // 并发拒绝：正在排队/执行中直接拒绝，不覆盖状态、不重复入队、不写 audit。
+    if (row.status === "pending" || row.status === "processing") {
+      return { kind: "busy", status: row.status, step: row.internal_status };
+    }
+    if (row.status !== "ready" || !row.has_last_good || !this.versionProbe) {
+      return this.admitSync(row, "automatic sync");
+    }
+
+    const observedVersion = row.version;
+    let probe: CodeGraphVersionProbeResult;
+    try {
+      probe = await this.versionProbe(row, this.dirFor(serviceId, teamId, codeGraphId));
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (!this.persistProbeDiagnostic(row, formatProbeDiagnostic("remote_error", message))) {
+        return this.classifySyncRace(serviceId, teamId, codeGraphId);
+      }
+      return { kind: "probe_failed", code: "remote_error", retryable: true, message };
+    }
+
+    if (probe.kind === "failed") {
+      if (!this.persistProbeDiagnostic(row, formatProbeDiagnostic(probe.code, probe.message))) {
+        return this.classifySyncRace(serviceId, teamId, codeGraphId);
+      }
+      return { kind: "probe_failed", code: probe.code, retryable: true, message: probe.message };
+    }
+    if (probe.kind !== "unchanged") {
+      return this.admitSync(row, "automatic sync");
+    }
+
+    // The read-only probe does not reserve the asset. Re-read the row so a
+    // concurrent manual sync/delete wins before unchanged is reported.
+    if (this.deleting.has(codeGraphId)) return { kind: "conflict" };
+    const current = this.store.getCodeGraph(serviceId, teamId, codeGraphId);
+    if (!current) return { kind: "not_found" };
+    if (current.status === "pending" || current.status === "processing") {
+      return { kind: "busy", status: current.status, step: current.internal_status };
+    }
+    if (current.status !== "ready" || !current.has_last_good || current.version !== observedVersion) {
+      return { kind: "conflict" };
+    }
+    if (current.auto_sync_probe_error !== null && !this.persistProbeDiagnostic(current, null)) {
+      return this.classifySyncRace(serviceId, teamId, codeGraphId);
+    }
+    return { kind: "unchanged", revision: probe.revision };
+  }
+
+  private persistProbeDiagnostic(row: CodeGraphRow, error: string | null): boolean {
+    return this.store.updateCodeGraphProbeDiagnostic(
+      row.service_id, row.team_id, row.code_graph_id, row.version, error,
+    );
+  }
+
+  private classifySyncRace(serviceId: string, teamId: string, codeGraphId: string): SyncResult {
+    const current = this.store.getCodeGraph(serviceId, teamId, codeGraphId);
+    if (!current) return { kind: "not_found" };
+    if (current.status === "pending" || current.status === "processing") {
+      return { kind: "busy", status: current.status, step: current.internal_status };
+    }
+    return { kind: "conflict" };
+  }
+
+  private admitSync(row: CodeGraphRow, auditDetail: string, requesterUserId?: string): SyncResult {
+    const { service_id: serviceId, team_id: teamId, code_graph_id: codeGraphId } = row;
+    if (this.deleting.has(codeGraphId)) return { kind: "conflict" };
     if (row.status === "pending" || row.status === "processing") {
       return { kind: "busy", status: row.status, step: row.internal_status };
     }
@@ -199,7 +295,7 @@ export class CodeGraphService {
     const fresh = this.store.getCodeGraph(serviceId, teamId, codeGraphId);
     if (!fresh) return { kind: "not_found" };
     if (fresh.status !== "pending" || fresh.version !== observedVersion + 1) return { kind: "conflict" };
-    this.audit(fresh, "ingest", "manual sync", requesterUserId);
+    this.audit(fresh, "ingest", auditDetail, requesterUserId);
     this.enqueueBuild(fresh, hadReadyIndex, preserveUntrustedCanonical);
     return { kind: "ok", row: fresh };
   }
@@ -449,9 +545,19 @@ export class CodeGraphService {
         last_sync_at: new Date().toISOString(),
       });
       committed = true;
+      let synced = this.store.getCodeGraphById(serviceId, codeGraphId);
+      if (synced && synced.auto_sync_probe_error !== null) {
+        const cleared = this.store.updateCodeGraphProbeDiagnostic(
+          serviceId, teamId, codeGraphId, synced.version, null,
+        );
+        if (!cleared) {
+          this.logger?.warn?.(`[code-graph] could not clear stale auto-sync probe diagnostic for ${codeGraphId}`);
+        } else {
+          synced = this.store.getCodeGraphById(serviceId, codeGraphId);
+        }
+      }
       try { await result.finalize?.(); }
       catch (err) { this.logger?.warn?.(`[code-graph] ${codeGraphId} previous snapshot cleanup failed: ${String(err)}`); }
-      const synced = this.store.getCodeGraphById(serviceId, codeGraphId);
       if (synced) {
         this.audit(synced, "ready", result.stats ? JSON.stringify(result.stats) : null);
       }

@@ -47,7 +47,8 @@ function fixture(lastSyncAt: string | null) {
     visibility: "private", status: lastSyncAt ? "ready" : "pending",
     internal_status: null, sync_error: null,
     stats_json: lastSyncAt ? '{"files":2,"nodes":3,"edges":4}' : null,
-    service_url: null, summary: "Existing summary", version: 1,
+    service_url: null, summary: "Existing summary",
+    auto_sync_probe_error: null, auto_sync_probe_at: null, version: 1,
     has_last_good: lastSyncAt !== null,
     last_sync_at: lastSyncAt, created_at: "2026-01-01T00:00:00Z",
     updated_at: "2026-01-01T00:00:00Z", deleted_at: null,
@@ -63,9 +64,19 @@ function fixture(lastSyncAt: string | null) {
       return true;
     }),
     updateCodeGraphStatus: (_serviceId: string, _id: string, patch: Partial<CodeGraphRow>) => { Object.assign(row, patch); },
+    updateCodeGraphProbeDiagnostic: (
+      _serviceId: string, _teamId: string, _id: string, version: number, error: string | null,
+    ) => {
+      if (row.status !== "ready" || !row.has_last_good || row.version !== version) return false;
+      row.auto_sync_probe_error = error;
+      row.auto_sync_probe_at = error === null ? null : new Date().toISOString();
+      return true;
+    },
     tryAdmitCodeGraphSync: (_serviceId: string, _teamId: string, _id: string, version: number) => {
       if ((row.status !== "ready" && row.status !== "failed") || row.version !== version) return false;
-      Object.assign(row, { status: "pending", internal_status: null, sync_error: null, version: version + 1 });
+      Object.assign(row, {
+        status: "pending", internal_status: null, sync_error: null, version: version + 1,
+      });
       return true;
     },
     appendCodeGraphAudit: (entry: { action: string; version: number }) => { audits.push(entry); },
@@ -563,5 +574,170 @@ describe("CodeGraphService refresh failure", () => {
     expect(worker).not.toHaveBeenCalled();
     expect(row.status).toBe("failed");
     expect(row.sync_error).toBe("SQLite status write failed");
+  });
+
+  it("returns unchanged before admission and leaves the last-good build untouched", async () => {
+    const { row, store, audits } = fixture("2026-01-01T00:00:00Z");
+    const admit = vi.spyOn(store, "tryAdmitCodeGraphSync");
+    const updateStatus = vi.spyOn(store, "updateCodeGraphStatus");
+    const releaseInstance = vi.fn();
+    const worker = vi.fn(async () => ({ commitHash: "unexpected" }));
+    const versionProbe = vi.fn(async () => ({ kind: "unchanged" as const, revision: "a".repeat(40) }));
+    const service = new CodeGraphService({ store, dataRoot: "/unused", worker, versionProbe, releaseInstance });
+
+    const before = { ...row };
+    await expect(service.syncIfChanged("svc-1", "team-1", row.code_graph_id)).resolves.toEqual({
+      kind: "unchanged", revision: "a".repeat(40),
+    });
+
+    expect(row).toEqual(before);
+    expect(versionProbe).toHaveBeenCalledOnce();
+    expect(admit).not.toHaveBeenCalled();
+    expect(updateStatus).not.toHaveBeenCalled();
+    expect(releaseInstance).not.toHaveBeenCalled();
+    expect(worker).not.toHaveBeenCalled();
+    expect(audits).toEqual([]);
+  });
+
+  it("keeps a last-good graph ready when the automatic version probe fails", async () => {
+    const { row, store, audits } = fixture("2026-01-01T00:00:00Z");
+    const worker = vi.fn(async () => ({ commitHash: "unexpected" }));
+    const versionProbe = vi.fn(async () => ({
+      kind: "failed" as const, code: "timeout" as const, retryable: true as const, message: "probe timed out",
+    }));
+    const service = new CodeGraphService({ store, dataRoot: "/unused", worker, versionProbe });
+
+    await expect(service.syncIfChanged("svc-1", "team-1", row.code_graph_id)).resolves.toEqual({
+      kind: "probe_failed", code: "timeout", retryable: true, message: "probe timed out",
+    });
+
+    expect(row.status).toBe("ready");
+    expect(row.sync_error).toBeNull();
+    expect(row.auto_sync_probe_error).toBe("[timeout] probe timed out");
+    expect(row.auto_sync_probe_at).not.toBeNull();
+    expect(row.last_sync_at).toBe("2026-01-01T00:00:00Z");
+    expect(worker).not.toHaveBeenCalled();
+    expect(audits).toEqual([]);
+  });
+
+  it("persists unexpected automatic probe exceptions as independent diagnostics", async () => {
+    const { row, store, audits } = fixture("2026-01-01T00:00:00Z");
+    const worker = vi.fn(async () => ({ commitHash: "unexpected" }));
+    const versionProbe = vi.fn(async () => { throw new Error("probe exploded"); });
+    const service = new CodeGraphService({ store, dataRoot: "/unused", worker, versionProbe });
+
+    await expect(service.syncIfChanged("svc-1", "team-1", row.code_graph_id)).resolves.toEqual({
+      kind: "probe_failed", code: "remote_error", retryable: true, message: "probe exploded",
+    });
+
+    expect(row.status).toBe("ready");
+    expect(row.sync_error).toBeNull();
+    expect(row.auto_sync_probe_error).toBe("[remote_error] probe exploded");
+    expect(row.auto_sync_probe_at).not.toBeNull();
+    expect(worker).not.toHaveBeenCalled();
+    expect(audits).toEqual([]);
+  });
+
+  it("admits one automatic refresh when the remote revision changed", async () => {
+    const { row, store } = fixture("2026-01-01T00:00:00Z");
+    const worker = vi.fn(async () => ({ commitHash: "b".repeat(40) }));
+    const versionProbe = vi.fn(async () => ({
+      kind: "changed" as const, localRevision: "a".repeat(40), remoteRevision: "b".repeat(40),
+    }));
+    const service = new CodeGraphService({ store, dataRoot: "/unused", worker, versionProbe });
+
+    expect((await service.syncIfChanged("svc-1", "team-1", row.code_graph_id)).kind).toBe("ok");
+    await service.onIdle(row.code_graph_id);
+
+    expect(worker).toHaveBeenCalledOnce();
+    expect(row.status).toBe("ready");
+    expect(row.commit_hash).toBe("b".repeat(40));
+  });
+
+  it("keeps a probe diagnostic through admission and clears it after a ready refresh", async () => {
+    const { row, store } = fixture("2026-01-01T00:00:00Z");
+    row.auto_sync_probe_error = "[timeout] previous probe timed out";
+    row.auto_sync_probe_at = "2026-01-02T00:00:00Z";
+    let releaseWorker!: () => void;
+    let workerStarted!: () => void;
+    const workerGate = new Promise<void>((resolve) => { releaseWorker = resolve; });
+    const started = new Promise<void>((resolve) => { workerStarted = resolve; });
+    const worker = vi.fn(async () => {
+      workerStarted();
+      await workerGate;
+      return { commitHash: "b".repeat(40) };
+    });
+    const versionProbe = vi.fn(async () => ({
+      kind: "changed" as const, localRevision: "a".repeat(40), remoteRevision: "b".repeat(40),
+    }));
+    const service = new CodeGraphService({ store, dataRoot: "/unused", worker, versionProbe });
+
+    await expect(service.syncIfChanged("svc-1", "team-1", row.code_graph_id)).resolves.toMatchObject({ kind: "ok" });
+    await started;
+    expect(row.status).toBe("processing");
+    expect(row.auto_sync_probe_error).toBe("[timeout] previous probe timed out");
+    expect(row.auto_sync_probe_at).toBe("2026-01-02T00:00:00Z");
+
+    releaseWorker();
+    await service.onIdle(row.code_graph_id);
+
+    expect(row.status).toBe("ready");
+    expect(row.auto_sync_probe_error).toBeNull();
+    expect(row.auto_sync_probe_at).toBeNull();
+  });
+
+  it("falls back to the existing refresh path when the local checkout or index is unverifiable", async () => {
+    const { row, store } = fixture("2026-01-01T00:00:00Z");
+    const worker = vi.fn(async () => ({ commitHash: "c".repeat(40) }));
+    const versionProbe = vi.fn(async () => ({
+      kind: "refresh_required" as const, reason: "canonical checkout or index is not verifiable",
+    }));
+    const service = new CodeGraphService({ store, dataRoot: "/unused", worker, versionProbe });
+
+    expect((await service.syncIfChanged("svc-1", "team-1", row.code_graph_id)).kind).toBe("ok");
+    await service.onIdle(row.code_graph_id);
+
+    expect(worker).toHaveBeenCalledOnce();
+    expect(row.commit_hash).toBe("c".repeat(40));
+  });
+
+  it("lets a concurrent manual sync win admission while an equality probe is pending", async () => {
+    const { row, store } = fixture("2026-01-01T00:00:00Z");
+    let finishProbe!: () => void;
+    const probeGate = new Promise<void>((resolve) => { finishProbe = resolve; });
+    let finishWorker!: () => void;
+    const workerGate = new Promise<void>((resolve) => { finishWorker = resolve; });
+    const worker = vi.fn(async () => {
+      await workerGate;
+      return { commitHash: "a".repeat(40) };
+    });
+    const versionProbe = vi.fn(async () => {
+      await probeGate;
+      return { kind: "unchanged" as const, revision: "a".repeat(40) };
+    });
+    const service = new CodeGraphService({ store, dataRoot: "/unused", worker, versionProbe });
+
+    const automatic = service.syncIfChanged("svc-1", "team-1", row.code_graph_id);
+    await Promise.resolve();
+    expect((await service.sync("svc-1", "team-1", row.code_graph_id)).kind).toBe("ok");
+    finishProbe();
+    await expect(automatic).resolves.toMatchObject({ kind: "busy" });
+
+    finishWorker();
+    await service.onIdle(row.code_graph_id);
+    expect(worker).toHaveBeenCalledOnce();
+  });
+
+  it("keeps explicit sync forceful even when the probe would report unchanged", async () => {
+    const { row, store } = fixture("2026-01-01T00:00:00Z");
+    const worker = vi.fn(async () => ({ commitHash: "a".repeat(40) }));
+    const versionProbe = vi.fn(async () => ({ kind: "unchanged" as const, revision: "a".repeat(40) }));
+    const service = new CodeGraphService({ store, dataRoot: "/unused", worker, versionProbe });
+
+    expect((await service.sync("svc-1", "team-1", row.code_graph_id)).kind).toBe("ok");
+    await service.onIdle(row.code_graph_id);
+
+    expect(versionProbe).not.toHaveBeenCalled();
+    expect(worker).toHaveBeenCalledOnce();
   });
 });

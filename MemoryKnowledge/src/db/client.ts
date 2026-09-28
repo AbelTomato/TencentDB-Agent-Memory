@@ -66,6 +66,8 @@ export function migrate(_db: Db, raw: Database.Database): void {
       internal_status TEXT,
       sync_error      TEXT,
       stats_json      TEXT,
+      auto_sync_probe_error TEXT,
+      auto_sync_probe_at TEXT,
       version         INTEGER NOT NULL DEFAULT 0,
       has_last_good   INTEGER NOT NULL DEFAULT 0,
       last_sync_at    TEXT,
@@ -157,6 +159,8 @@ export function migrate(_db: Db, raw: Database.Database): void {
   // so we check PRAGMA table_info first.
   addColumnIfMissing(raw, "knowledge_code_graph", "service_url", "TEXT");
   addColumnIfMissing(raw, "knowledge_code_graph", "summary", "TEXT");
+  addColumnIfMissing(raw, "knowledge_code_graph", "auto_sync_probe_error", "TEXT");
+  addColumnIfMissing(raw, "knowledge_code_graph", "auto_sync_probe_at", "TEXT");
   // Existing ready rows have already committed a serving index. This backfill
   // runs only when the column is first added; later writes use the explicit flag.
   raw.transaction(() => {

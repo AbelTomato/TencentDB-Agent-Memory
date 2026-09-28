@@ -24,6 +24,7 @@ import { CodeGraphHandleCloseError, openIndex, getStats, closeIndex, type CodeGr
 import { SourceFetcherRegistry } from "./source-fetcher/index.js";
 import { createCodeGraphWorker } from "./code-graph-worker.js";
 import { recoverInterruptedCodeGraphs } from "./code-graph-recovery.js";
+import { createCodeGraphVersionProbe } from "./code-graph-version-probe.js";
 import { acquireDataRootOwnership, acquireKnowledgeStoreOwnership, type DataRootOwnership } from "./data-root-ownership.js";
 import { createLogger } from "./logger.js";
 import type { LlmConfig } from "./config.js";
@@ -403,6 +404,7 @@ function buildKnowledgeModule(config: KnowledgeModuleConfig, ownership: DataRoot
     logger: { info: log.info.bind(log), warn: log.warn.bind(log), error: log.error.bind(log) },
     callbackConfig,
     releaseInstance: createCodeGraphInstanceReleaser(instancePool),
+    versionProbe: createCodeGraphVersionProbe({ resolveFetcher: (url) => fetcherRegistry.resolve(url) }),
   });
 
   // A refresh still has a last-good index; an initial build does not.

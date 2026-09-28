@@ -41,7 +41,7 @@ function hasIndexSnapshot(dir: string): boolean {
 }
 
 /** Resolve symbolic and packed refs, and require HEAD to name a real commit. */
-function verifiedHead(dir: string): string | null {
+export function verifiedCodeGraphHead(dir: string): string | null {
   if (!hasIndexSnapshot(dir)) return null;
   try {
     const head = execFileSync("git", ["-C", dir, "rev-parse", "--verify", "HEAD^{commit}"], {
@@ -51,10 +51,10 @@ function verifiedHead(dir: string): string | null {
   } catch { return null; }
 }
 
-/** The fetcher persists a twelve-character SHA prefix. */
+/** Accept legacy SHA prefixes while new builds persist the full commit SHA. */
 function matchesCommittedHead(dir: string, commitHash: string | null): boolean {
   if (!commitHash || !/^[0-9a-f]{7,64}$/i.test(commitHash)) return false;
-  return verifiedHead(dir)?.toLowerCase().startsWith(commitHash.toLowerCase()) ?? false;
+  return verifiedCodeGraphHead(dir)?.toLowerCase().startsWith(commitHash.toLowerCase()) ?? false;
 }
 
 function unavailablePatch(reason: string, phase: string): Parameters<RecoveryStore["updateCodeGraphStatus"]>[2] {
@@ -255,7 +255,7 @@ export function recoverInterruptedCodeGraphs(
       try {
         const row = store.getCodeGraph(ref.service_id, ref.team_id, ref.code_graph_id);
         if (!row) continue;
-        if (!verifiedHead(previousDir)) {
+        if (!verifiedCodeGraphHead(previousDir)) {
           store.updateCodeGraphStatus(ref.service_id, ref.code_graph_id,
             unavailablePatch("previous snapshot has no verifiable Git HEAD; manual recovery required", AMBIGUOUS_PREVIOUS));
           continue;

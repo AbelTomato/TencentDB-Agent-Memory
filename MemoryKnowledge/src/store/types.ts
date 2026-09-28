@@ -46,6 +46,9 @@ export interface CodeGraphRow {
   stats_json: string | null;
   service_url: string | null;
   summary: string | null;
+  /** Last automatic remote-version probe diagnostic; separate from build errors. */
+  auto_sync_probe_error: string | null;
+  auto_sync_probe_at: string | null;
   version: number;
   /** A previously committed CodeGraph index exists, even if last_sync_at is absent. */
   has_last_good: boolean;
@@ -218,6 +221,14 @@ export interface IKnowledgeStore {
   listCodeGraphs(serviceId: string, teamId: string, opts?: ListOpts): CodeGraphRow[];
   countCodeGraphs(serviceId: string, teamId: string, opts?: CountOpts): number;
   updateCodeGraphStatus(serviceId: string, codeGraphId: string, patch: CodeGraphStatusPatch): void;
+  /** CAS-guarded probe diagnostic update that leaves build metadata untouched. */
+  updateCodeGraphProbeDiagnostic(
+    serviceId: string,
+    teamId: string,
+    codeGraphId: string,
+    expectedVersion: number,
+    error: string | null,
+  ): boolean;
   /** Atomically admit one refresh for this tenant, asset, and observed version. */
   tryAdmitCodeGraphSync(serviceId: string, teamId: string, codeGraphId: string, expectedVersion: number): boolean;
   deleteCodeGraph(serviceId: string, teamId: string, codeGraphId: string): boolean;

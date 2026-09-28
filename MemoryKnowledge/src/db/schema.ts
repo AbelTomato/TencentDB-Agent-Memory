@@ -36,6 +36,8 @@ export const knowledgeCodeGraph = sqliteTable(
     statsJson: text("stats_json"),
     serviceUrl: text("service_url"),
     summary: text("summary"),
+    autoSyncProbeError: text("auto_sync_probe_error"),
+    autoSyncProbeAt: text("auto_sync_probe_at"),
     version: integer("version").notNull().default(0),
     hasLastGood: integer("has_last_good", { mode: "boolean" }).notNull().default(false),
     lastSyncAt: text("last_sync_at"),

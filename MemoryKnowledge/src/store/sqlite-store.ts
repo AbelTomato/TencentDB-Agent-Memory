@@ -227,6 +227,32 @@ export class SqliteKnowledgeStore implements IKnowledgeStore {
       .run();
   }
 
+  updateCodeGraphProbeDiagnostic(
+    serviceId: string,
+    teamId: string,
+    codeGraphId: string,
+    expectedVersion: number,
+    error: string | null,
+  ): boolean {
+    const result = this.db
+      .update(knowledgeCodeGraph)
+      .set({
+        autoSyncProbeError: error,
+        autoSyncProbeAt: error === null ? null : nowIso(),
+      })
+      .where(and(
+        eq(knowledgeCodeGraph.codeGraphId, codeGraphId),
+        eq(knowledgeCodeGraph.serviceId, serviceId),
+        eq(knowledgeCodeGraph.teamId, teamId),
+        eq(knowledgeCodeGraph.version, expectedVersion),
+        eq(knowledgeCodeGraph.status, "ready"),
+        eq(knowledgeCodeGraph.hasLastGood, true),
+        isNull(knowledgeCodeGraph.deletedAt),
+      ))
+      .run();
+    return result.changes === 1;
+  }
+
   /** One SQLite UPDATE is the admission point shared by all service instances. */
   tryAdmitCodeGraphSync(serviceId: string, teamId: string, codeGraphId: string, expectedVersion: number): boolean {
     const result = this.db
@@ -653,6 +679,8 @@ export class SqliteKnowledgeStore implements IKnowledgeStore {
       stats_json: r.statsJson,
       service_url: r.serviceUrl ?? null,
       summary: r.summary ?? null,
+      auto_sync_probe_error: r.autoSyncProbeError ?? null,
+      auto_sync_probe_at: r.autoSyncProbeAt ?? null,
       version: r.version,
       has_last_good: r.hasLastGood,
       last_sync_at: r.lastSyncAt,

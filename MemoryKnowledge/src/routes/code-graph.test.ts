@@ -19,7 +19,8 @@ function rowWith(patch: Partial<CodeGraphRow> = {}): CodeGraphRow {
     commit_hash: "last-good-commit", owner_user_id: null, user_id: null,
     agent_id: null, task_id: null, visibility: "team", status: "ready",
     internal_status: null, sync_error: null, stats_json: null, service_url: null,
-    summary: null, version: 2, has_last_good: true, last_sync_at: "2026-09-25T00:00:00Z",
+    summary: null, auto_sync_probe_error: null, auto_sync_probe_at: null,
+    version: 2, has_last_good: true, last_sync_at: "2026-09-25T00:00:00Z",
     created_at: "2026-09-24T00:00:00Z", updated_at: "2026-09-25T00:00:00Z",
     deleted_at: null, ...patch,
   };
