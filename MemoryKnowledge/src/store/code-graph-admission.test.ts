@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -8,6 +9,10 @@ import { BuildQueue } from "./build-queue.js";
 import { CodeGraphService } from "./code-graph-service.js";
 import { SqliteKnowledgeStore } from "./sqlite-store.js";
 import { recoverInterruptedCodeGraphs } from "../code-graph-recovery.js";
+import { createCodeGraphWorker } from "../code-graph-worker.js";
+import { resolveCodeGraphQueryAccess } from "../routes/tools.js";
+import type { CodeGraphInstancePool } from "../module.js";
+import type { ISourceFetcher } from "../source-fetcher/index.js";
 
 const roots: string[] = [];
 afterEach(() => {
@@ -15,6 +20,92 @@ afterEach(() => {
 });
 
 describe("CodeGraph refresh admission", () => {
+  it("atomically removes serving eligibility when retrying a failed asset", () => {
+    const root = mkdtempSync(join(tmpdir(), "knowledge-failed-admission-"));
+    roots.push(root);
+    const connection = createDb({ path: join(root, "knowledge.sqlite") });
+    try {
+      const store = new SqliteKnowledgeStore(connection.db);
+      const row = store.createCodeGraph({
+        service_id: "svc-1", team_id: "team-1", repo_url: "https://example.com/repo.git", branch: "main",
+      }).row;
+      store.updateCodeGraphStatus("svc-1", row.code_graph_id, {
+        status: "failed", has_last_good: true, commit_hash: "prior-success",
+      });
+
+      expect(store.tryAdmitCodeGraphSync("svc-1", "team-1", row.code_graph_id, row.version)).toBe(true);
+      expect(store.getCodeGraphById("svc-1", row.code_graph_id)).toMatchObject({
+        status: "pending", has_last_good: false, commit_hash: "prior-success",
+      });
+    } finally {
+      connection.raw.close();
+    }
+  });
+
+  it("retries failed canonical through a real worker without deleting its only snapshot on fetch failure", async () => {
+    const root = mkdtempSync(join(tmpdir(), "knowledge-failed-worker-"));
+    roots.push(root);
+    const connection = createDb({ path: join(root, "knowledge.sqlite") });
+    let failFetch!: (error: Error) => void;
+    let fetchStarted!: () => void;
+    const started = new Promise<void>((resolve) => { fetchStarted = resolve; });
+    const stalledFetch = new Promise<never>((_resolve, reject) => { failFetch = reject; });
+    try {
+      const store = new SqliteKnowledgeStore(connection.db);
+      const created = store.createCodeGraph({
+        service_id: "svc-1", team_id: "team-1", repo_url: "https://example.com/repo.git", branch: "main",
+      }).row;
+      const dir = join(root, "svc-1", "team-1", created.code_graph_id);
+      mkdirSync(join(dir, ".git"), { recursive: true });
+      mkdirSync(join(dir, ".codegraph"), { recursive: true });
+      writeFileSync(join(dir, "only-snapshot"), "keep this version");
+      writeFileSync(join(dir, ".codegraph", "codegraph.db"), "old index");
+      store.updateCodeGraphStatus("svc-1", created.code_graph_id, {
+        status: "failed", has_last_good: true, commit_hash: "old-commit",
+      });
+      const pool = {
+        get: () => undefined, set: () => {}, delete: () => {},
+        pause: async () => {}, resume: () => {},
+      } as CodeGraphInstancePool;
+      const fetcher = {
+        supportedType: "git", validate: () => {},
+        fetch: async () => { fetchStarted(); return stalledFetch; },
+        sync: async () => { throw new Error("failed retry must start with a fresh candidate"); },
+      } as ISourceFetcher;
+      const worker = createCodeGraphWorker({
+        instancePool: pool, resolveFetcher: () => fetcher,
+        indexOps: {
+          openIndex: async () => { throw new Error("not reached"); },
+          indexProject: async () => { throw new Error("not reached"); },
+          syncIndex: async () => ({ changed: 0 }),
+          closeIndex: () => {}, getStats: () => ({}),
+        },
+      });
+      const service = new CodeGraphService({ store, dataRoot: root, worker });
+
+      expect((await service.sync("svc-1", "team-1", created.code_graph_id)).kind).toBe("ok");
+      await started;
+      const inFlight = store.getCodeGraphById("svc-1", created.code_graph_id)!;
+      expect(inFlight.status).toBe("processing");
+      expect(inFlight.has_last_good).toBe(false);
+      const access = await resolveCodeGraphQueryAccess("svc-1", inFlight, service, pool);
+      expect("response" in access && (await access.response.json()).error_code).toBe("CODE_GRAPH_INDEX_BUILDING");
+
+      failFetch(new Error("network unavailable"));
+      await service.onIdle(created.code_graph_id);
+      expect(store.getCodeGraphById("svc-1", created.code_graph_id)).toMatchObject({
+        status: "failed", has_last_good: false,
+      });
+      expect(readFileSync(join(dir, "only-snapshot"), "utf8")).toBe("keep this version");
+      expect(existsSync(`${dir}.suspect`)).toBe(false);
+      expect(existsSync(`${dir}.previous`)).toBe(false);
+      expect(readdirSync(join(root, "svc-1", "team-1"))).toEqual([created.code_graph_id]);
+    } finally {
+      failFetch?.(new Error("test teardown"));
+      connection.raw.close();
+    }
+  });
+
   it("admits one of two services sharing a SQLite database and separate queues", async () => {
     const root = mkdtempSync(join(tmpdir(), "knowledge-admission-"));
     roots.push(root);
@@ -106,17 +197,30 @@ describe("CodeGraph refresh admission", () => {
       }).row;
       const firstBuild = makeAsset("initial");
       const refreshed = makeAsset("refresh");
+      let refreshedCommit = "";
+      for (const row of [firstBuild, refreshed]) {
+        const dir = join(root, "svc-1", "team-1", row.code_graph_id);
+        mkdirSync(dir, { recursive: true });
+        execFileSync("git", ["init", "-q", dir]);
+        writeFileSync(join(dir, "source.ts"), "export const value = 1;\n");
+        execFileSync("git", ["-C", dir, "add", "source.ts"]);
+        execFileSync("git", ["-C", dir, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "initial"]);
+        if (row.code_graph_id === refreshed.code_graph_id) {
+          refreshedCommit = execFileSync("git", ["-C", dir, "rev-parse", "HEAD"], { encoding: "utf8" }).trim().slice(0, 12);
+        }
+        const indexDir = join(dir, ".codegraph");
+        mkdirSync(indexDir, { recursive: true });
+        const indexDb = createDb({ path: join(indexDir, "codegraph.db") });
+        indexDb.raw.close();
+      }
       store.updateCodeGraphStatus("svc-1", refreshed.code_graph_id, {
-        status: "ready", has_last_good: true, last_sync_at: null,
+        status: "ready", has_last_good: true, last_sync_at: null, commit_hash: refreshedCommit,
       });
       expect(store.tryAdmitCodeGraphSync("svc-1", "team-1", refreshed.code_graph_id, refreshed.version)).toBe(true);
-      for (const row of [firstBuild, refreshed]) {
-        const gitDir = join(root, "svc-1", "team-1", row.code_graph_id, ".git");
-        mkdirSync(gitDir, { recursive: true });
-        writeFileSync(join(gitDir, "HEAD"), "old-commit");
-      }
 
-      expect(store.listRecoverableCodeGraphs().map((row) => row.code_graph_id)).toEqual([refreshed.code_graph_id]);
+      expect(store.listRecoverableCodeGraphs().map((row) => row.code_graph_id).sort()).toEqual(
+        [firstBuild.code_graph_id, refreshed.code_graph_id].sort(),
+      );
       expect(recoverInterruptedCodeGraphs(store, root)).toBe(1);
       expect(store.getCodeGraphById("svc-1", refreshed.code_graph_id)?.status).toBe("ready");
       expect(store.getCodeGraphById("svc-1", firstBuild.code_graph_id)?.status).toBe("pending");

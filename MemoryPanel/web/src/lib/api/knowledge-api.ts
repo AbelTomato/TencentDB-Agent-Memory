@@ -111,6 +111,19 @@ export interface CodeGraphDetail {
   updated_at: string;
 }
 
+export interface CodeGraphQueryResult {
+  text: string;
+  isError: boolean;
+  stale?: boolean;
+  served_commit_hash?: string | null;
+  last_sync_at?: string | null;
+}
+
+export interface CodeGraphDeleteResult {
+  deleted_ids: string[];
+  failed: Array<{ id: string; reason: string }>;
+}
+
 // ---- 兼容旧类型（平滑过渡） ----
 
 /** @deprecated 用 WikiDetail 替代 */
@@ -462,15 +475,15 @@ export const knowledgeApi = {
       panelPost('/code-graph/sync', { code_graph_id: codeGraphId }),
 
     /** 删除 */
-    delete: (codeGraphId: string): Promise<void> =>
+    delete: (codeGraphId: string): Promise<CodeGraphDeleteResult> =>
       panelPost('/code-graph/delete', { code_graph_ids: [codeGraphId] }),
 
-    /** 代码搜索（返回 { text, isError } 文本块） */
-    search: (opts: { codeGraphId: string; query: string; kind?: string; limit?: number }): Promise<{ text: string; isError: boolean }> =>
+    /** 代码搜索；刷新期间可能返回带旧索引标记的文本块。 */
+    search: (opts: { codeGraphId: string; query: string; kind?: string; limit?: number }): Promise<CodeGraphQueryResult> =>
       panelPost('/code-graph/search', { code_graph_id: opts.codeGraphId, query: opts.query, ...(opts.kind && opts.kind !== 'any' ? { kind: opts.kind } : {}), limit: opts.limit ?? 10 }),
 
-    /** 代码探索（返回 { text, isError } 文本块） */
-    explore: (codeGraphId: string, query: string): Promise<{ text: string; isError: boolean }> =>
+    /** 代码探索；刷新期间可能返回带旧索引标记的文本块。 */
+    explore: (codeGraphId: string, query: string): Promise<CodeGraphQueryResult> =>
       panelPost('/code-graph/explore', { code_graph_id: codeGraphId, query }),
 
     /** 详情（用于 sync 后轮询） */

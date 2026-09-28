@@ -5,23 +5,38 @@ import { join } from "node:path";
 
 import { CodeGraphService, PreservedCodeGraphError } from "./code-graph-service.js";
 import { createCodeGraphRoutes } from "../routes/code-graph.js";
-import type { CodeGraphInstancePool } from "../module.js";
+import { createCodeGraphInstancePool, createCodeGraphInstanceReleaser, type CodeGraphInstancePool } from "../module.js";
+import type { CodeGraphInstance } from "../engines/code/index.js";
 import type { CodeGraphRow, IKnowledgeStore } from "./types.js";
 
-const cleanupProbe = vi.hoisted(() => ({ failPreviousRemoval: false }));
+const removalProbe = vi.hoisted(() => ({
+  failCanonicalOnce: false,
+  blockCanonical: null as Promise<void> | null,
+  canonicalStarted: null as (() => void) | null,
+}));
 vi.mock("node:fs/promises", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs/promises")>();
   return {
     ...actual,
     rm: async (...args: Parameters<typeof actual.rm>) => {
-      if (cleanupProbe.failPreviousRemoval && String(args[0]).endsWith(".previous")) {
-        throw new Error("previous directory is busy");
+      if (removalProbe.blockCanonical && String(args[0]).endsWith("/cg-1")) {
+        removalProbe.canonicalStarted?.();
+        await removalProbe.blockCanonical;
+      }
+      if (removalProbe.failCanonicalOnce && String(args[0]).endsWith("/cg-1")) {
+        removalProbe.failCanonicalOnce = false;
+        throw new Error("disk removal failed");
       }
       return actual.rm(...args);
     },
   };
 });
-afterEach(() => { cleanupProbe.failPreviousRemoval = false; vi.unstubAllGlobals(); });
+afterEach(() => {
+  removalProbe.failCanonicalOnce = false;
+  removalProbe.blockCanonical = null;
+  removalProbe.canonicalStarted = null;
+  vi.unstubAllGlobals();
+});
 
 function fixture(lastSyncAt: string | null) {
   const row: CodeGraphRow = {
@@ -40,8 +55,13 @@ function fixture(lastSyncAt: string | null) {
   const audits: Array<{ action: string; version: number }> = [];
   const store = {
     createCodeGraph: () => ({ row, existed: false }),
-    getCodeGraph: () => row,
-    getCodeGraphById: () => row,
+    getCodeGraph: () => row.deleted_at ? null : row,
+    getCodeGraphById: () => row.deleted_at ? null : row,
+    deleteCodeGraph: vi.fn(() => {
+      if (row.deleted_at) return false;
+      row.deleted_at = new Date().toISOString();
+      return true;
+    }),
     updateCodeGraphStatus: (_serviceId: string, _id: string, patch: Partial<CodeGraphRow>) => { Object.assign(row, patch); },
     tryAdmitCodeGraphSync: (_serviceId: string, _teamId: string, _id: string, version: number) => {
       if ((row.status !== "ready" && row.status !== "failed") || row.version !== version) return false;
@@ -87,44 +107,6 @@ describe("CodeGraphService refresh failure", () => {
     });
     expect(response.status).toBe(200);
     expect((await response.json()).data.text).toBe("old index still answers");
-  });
-
-  it("clears a retired snapshot after admission but before starting the worker", async () => {
-    const { row, store } = fixture("2026-01-01T00:00:00Z");
-    const root = mkdtempSync(join(tmpdir(), "knowledge-service-"));
-    const previousDir = join(root, "svc-1", "team-1", "cg-1.previous");
-    mkdirSync(previousDir, { recursive: true });
-    try {
-      const service = new CodeGraphService({
-        store, dataRoot: root,
-        worker: async () => { throw new PreservedCodeGraphError(new Error("Git unavailable")); },
-      });
-
-      await service.sync("svc-1", "team-1", "cg-1");
-      expect(existsSync(previousDir)).toBe(false);
-      await service.onIdle("cg-1");
-      expect(row.status).toBe("ready");
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
-  });
-
-  it("continues an admitted refresh when retired snapshot cleanup fails", async () => {
-    const { row, store } = fixture("2026-01-01T00:00:00Z");
-    const warnings: string[] = [];
-    let called = 0;
-    const service = new CodeGraphService({
-      store, dataRoot: "/unused", logger: { warn: (msg) => warnings.push(msg) },
-      worker: async () => { called++; throw new PreservedCodeGraphError(new Error("Git unavailable")); },
-    });
-    cleanupProbe.failPreviousRemoval = true;
-
-    expect((await service.sync("svc-1", "team-1", "cg-1")).kind).toBe("ok");
-    await service.onIdle("cg-1");
-
-    expect(called).toBe(1);
-    expect(row.status).toBe("ready");
-    expect(warnings.some((msg) => msg.includes("previous directory is busy"))).toBe(true);
   });
 
   it("reports preserved refresh failure distinctly to audit and Panel", async () => {
@@ -268,17 +250,318 @@ describe("CodeGraphService refresh failure", () => {
     expect(row.commit_hash).toBe("new-commit");
   });
 
-  it("removes orphaned candidate directories when an asset is deleted", () => {
+  it("removes orphaned candidate directories when an asset is deleted", async () => {
     const { store } = fixture("2026-01-01T00:00:00Z");
     const root = mkdtempSync(join(tmpdir(), "knowledge-candidate-delete-"));
     const candidate = join(root, "svc-1", "team-1", ".cg-1.candidate-1234");
     mkdirSync(candidate, { recursive: true });
     try {
       const service = new CodeGraphService({ store, dataRoot: root, worker: async () => ({}) });
-      expect(service.delete("svc-1", "team-1", "cg-1")).toBe(true);
+      expect(await service.delete("svc-1", "team-1", "cg-1")).toBe(true);
+      await service.onIdle("cg-1");
       expect(existsSync(candidate)).toBe(false);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  it("rejects delete while a query holds an index lease without deleting later", async () => {
+    const { row, store } = fixture("2026-01-01T00:00:00Z");
+    const root = mkdtempSync(join(tmpdir(), "knowledge-delete-query-"));
+    const dir = join(root, "svc-1", "team-1", row.code_graph_id);
+    mkdirSync(dir, { recursive: true });
+    let queryStarted!: () => void;
+    let finishQuery!: () => void;
+    const started = new Promise<void>((resolve) => { queryStarted = resolve; });
+    const blocked = new Promise<void>((resolve) => { finishQuery = resolve; });
+    const closeIndex = vi.fn();
+    const pool = createCodeGraphInstancePool({ openIndex: vi.fn(), closeIndex });
+    pool.set(row.code_graph_id, {
+      projectRoot: dir, cg: {}, handler: { execute: async () => {
+        queryStarted();
+        await blocked;
+        return { content: [{ text: "query completed" }], isError: false };
+      } },
+    });
+    const service = new CodeGraphService({
+      store, dataRoot: root, worker: async () => ({}),
+      releaseInstance: createCodeGraphInstanceReleaser(pool, closeIndex),
+    });
+    try {
+      const routes = createCodeGraphRoutes({ cgService: service, instancePool: pool, publicBaseUrl: "" });
+      const query = routes.request("/status", {
+        method: "POST", headers: { "content-type": "application/json", "x-tdai-service-id": "svc-1" },
+        body: JSON.stringify({ code_graph_id: row.code_graph_id }),
+      });
+      await started;
+      expect(await service.delete("svc-1", "team-1", row.code_graph_id)).toBe(false);
+      expect(closeIndex).not.toHaveBeenCalled();
+      expect(store.deleteCodeGraph).not.toHaveBeenCalled();
+      expect(existsSync(dir)).toBe(true);
+
+      finishQuery();
+      expect((await query).status).toBe(200);
+      expect(store.deleteCodeGraph).not.toHaveBeenCalled();
+      expect(await service.delete("svc-1", "team-1", row.code_graph_id)).toBe(true);
+      await service.onIdle(row.code_graph_id);
+      expect(closeIndex).toHaveBeenCalledOnce();
+      expect(existsSync(dir)).toBe(false);
+    } finally {
+      finishQuery();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects delete during a lazy index load without deleting later", async () => {
+    const { row, store } = fixture("2026-01-01T00:00:00Z");
+    const root = mkdtempSync(join(tmpdir(), "knowledge-delete-load-"));
+    const dir = join(root, "svc-1", "team-1", row.code_graph_id);
+    mkdirSync(dir, { recursive: true });
+    let loadStarted!: () => void;
+    let finishLoad!: (instance: CodeGraphInstance) => void;
+    const started = new Promise<void>((resolve) => { loadStarted = resolve; });
+    const opening = new Promise<CodeGraphInstance>((resolve) => { finishLoad = resolve; });
+    const closeIndex = vi.fn();
+    const pool = createCodeGraphInstancePool({
+      openIndex: vi.fn(async () => { loadStarted(); return opening; }), closeIndex,
+    });
+    const service = new CodeGraphService({
+      store, dataRoot: root, worker: async () => ({}),
+      releaseInstance: createCodeGraphInstanceReleaser(pool, closeIndex),
+    });
+    try {
+      const routes = createCodeGraphRoutes({ cgService: service, instancePool: pool, publicBaseUrl: "" });
+      const query = routes.request("/status", {
+        method: "POST", headers: { "content-type": "application/json", "x-tdai-service-id": "svc-1" },
+        body: JSON.stringify({ code_graph_id: row.code_graph_id }),
+      });
+      await started;
+      expect(await service.delete("svc-1", "team-1", row.code_graph_id)).toBe(false);
+      expect(store.deleteCodeGraph).not.toHaveBeenCalled();
+      expect(existsSync(dir)).toBe(true);
+      finishLoad({ projectRoot: dir, cg: {}, handler: { execute: async () => ({ content: [{ text: "ok" }], isError: false }) } });
+      expect((await query).status).toBe(200);
+      expect(store.deleteCodeGraph).not.toHaveBeenCalled();
+      expect(await service.delete("svc-1", "team-1", row.code_graph_id)).toBe(true);
+      await service.onIdle(row.code_graph_id);
+      expect(closeIndex).toHaveBeenCalledOnce();
+      expect(existsSync(dir)).toBe(false);
+    } finally {
+      finishLoad({ projectRoot: dir, cg: {}, handler: { execute: async () => ({ content: [{ text: "ok" }], isError: false }) } });
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves the last-good directory and reports failure when metadata deletion fails", async () => {
+    const { row, store } = fixture("2026-01-01T00:00:00Z");
+    const root = mkdtempSync(join(tmpdir(), "knowledge-delete-failure-"));
+    const dir = join(root, "svc-1", "team-1", row.code_graph_id);
+    mkdirSync(dir, { recursive: true });
+    const resume = vi.fn();
+    store.deleteCodeGraph = vi.fn(() => { throw new Error("SQLite unavailable"); });
+    const service = new CodeGraphService({
+      store, dataRoot: root, worker: async () => ({}),
+      releaseInstance: async () => resume,
+    });
+    try {
+      expect(await service.delete("svc-1", "team-1", row.code_graph_id)).toBe(false);
+      expect(existsSync(dir)).toBe(true);
+      expect(row.status).toBe("ready");
+      expect(resume).toHaveBeenCalledOnce();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not commit a delete after index close has exhausted the request deadline", async () => {
+    const { row, store } = fixture("2026-01-01T00:00:00Z");
+    const root = mkdtempSync(join(tmpdir(), "knowledge-delete-deadline-"));
+    const dir = join(root, "svc-1", "team-1", row.code_graph_id);
+    mkdirSync(dir, { recursive: true });
+    let now = 1_000;
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const resume = vi.fn();
+    const releaseInstance = vi.fn(async () => {
+      now = 12_000;
+      return resume;
+    });
+    const service = new CodeGraphService({
+      store, dataRoot: root, worker: async () => ({}), releaseInstance,
+    });
+    try {
+      expect(await service.delete("svc-1", "team-1", row.code_graph_id)).toBe(false);
+      expect(store.deleteCodeGraph).not.toHaveBeenCalled();
+      expect(existsSync(dir)).toBe(true);
+      expect(resume).toHaveBeenCalledOnce();
+
+      // A fresh caller may retry; the earlier timed-out attempt cannot
+      // commit a hard delete after its response deadline.
+      expect(await service.delete("svc-1", "team-1", row.code_graph_id)).toBe(true);
+      await service.onIdle(row.code_graph_id);
+      expect(store.deleteCodeGraph).toHaveBeenCalledOnce();
+      expect(existsSync(dir)).toBe(false);
+    } finally {
+      clock.mockRestore();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("retries file cleanup only for a deleted asset recorded by this service", async () => {
+    const { row, store } = fixture("2026-01-01T00:00:00Z");
+    const root = mkdtempSync(join(tmpdir(), "knowledge-delete-retry-"));
+    const dir = join(root, "svc-1", "team-1", row.code_graph_id);
+    mkdirSync(dir, { recursive: true });
+    const service = new CodeGraphService({ store, dataRoot: root, worker: async () => ({}) });
+    const routes = createCodeGraphRoutes({ cgService: service, instancePool: {} as CodeGraphInstancePool, publicBaseUrl: "" });
+    const request = () => routes.request("/delete", {
+      method: "POST", headers: { "content-type": "application/json", "x-tdai-service-id": "svc-1" },
+      body: JSON.stringify({ code_graph_ids: [row.code_graph_id] }),
+    });
+    try {
+      removalProbe.failCanonicalOnce = true;
+      const first = await request();
+      expect((await first.json()).data.deleted_ids).toEqual([row.code_graph_id]);
+      await service.onIdle(row.code_graph_id);
+      expect(store.getCodeGraphById("svc-1", row.code_graph_id)).toBeNull();
+      expect(service.hasPendingCleanup("svc-1", row.code_graph_id)).toBe(true);
+      expect(existsSync(dir)).toBe(true);
+
+      const second = await request();
+      expect((await second.json()).data.deleted_ids).toEqual([row.code_graph_id]);
+      await service.onIdle(row.code_graph_id);
+      expect(service.hasPendingCleanup("svc-1", row.code_graph_id)).toBe(false);
+      expect(existsSync(dir)).toBe(false);
+      const third = await request();
+      expect((await third.json()).data.failed).toEqual([{ id: row.code_graph_id, reason: "not found" }]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("confirms metadata deletion before a slow directory removal finishes", async () => {
+    const { row, store } = fixture("2026-01-01T00:00:00Z");
+    const root = mkdtempSync(join(tmpdir(), "knowledge-delete-slow-files-"));
+    const dir = join(root, "svc-1", "team-1", row.code_graph_id);
+    mkdirSync(dir, { recursive: true });
+    let startRemoval!: () => void;
+    let finishRemoval!: () => void;
+    const started = new Promise<void>((resolve) => { startRemoval = resolve; });
+    removalProbe.blockCanonical = new Promise<void>((resolve) => { finishRemoval = resolve; });
+    removalProbe.canonicalStarted = startRemoval;
+    const service = new CodeGraphService({ store, dataRoot: root, worker: async () => ({}) });
+    try {
+      const deleting = service.delete("svc-1", "team-1", row.code_graph_id);
+      await started;
+      expect(await deleting).toBe(true);
+      expect(store.getCodeGraphById("svc-1", row.code_graph_id)).toBeNull();
+      expect(existsSync(dir)).toBe(true);
+      expect(service.hasPendingCleanup("svc-1", row.code_graph_id)).toBe(true);
+      finishRemoval();
+      await service.onIdle(row.code_graph_id);
+      expect(existsSync(dir)).toBe(false);
+      expect(service.hasPendingCleanup("svc-1", row.code_graph_id)).toBe(false);
+    } finally {
+      finishRemoval();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects deletion during a running build without scheduling a late hard delete", async () => {
+    const { row, store } = fixture(null);
+    const root = mkdtempSync(join(tmpdir(), "knowledge-delete-building-"));
+    const events: string[] = [];
+    const hardDelete = store.deleteCodeGraph.bind(store);
+    store.deleteCodeGraph = vi.fn((serviceId, teamId, id) => {
+      events.push("metadata deleted");
+      return hardDelete(serviceId, teamId, id);
+    });
+    let workerStarted!: () => void;
+    let finishWorker!: () => void;
+    const started = new Promise<void>((resolve) => { workerStarted = resolve; });
+    const blocked = new Promise<void>((resolve) => { finishWorker = resolve; });
+    const service = new CodeGraphService({
+      store, dataRoot: root,
+      worker: async (ctx) => {
+        workerStarted();
+        await blocked;
+        mkdirSync(ctx.dir, { recursive: true });
+        events.push("worker wrote directory");
+        return { commitHash: "built" };
+      },
+    });
+    try {
+      service.create({ service_id: "svc-1", team_id: "team-1", repo_url: row.repo_url, branch: "main" });
+      await started;
+      expect(await service.delete("svc-1", "team-1", row.code_graph_id)).toBe(false);
+      expect(store.deleteCodeGraph).not.toHaveBeenCalled();
+      finishWorker();
+      await service.onIdle(row.code_graph_id);
+      expect(events).toEqual(["worker wrote directory"]);
+      expect(store.getCodeGraphById("svc-1", row.code_graph_id)?.status).toBe("ready");
+      expect(existsSync(service.dirFor("svc-1", "team-1", row.code_graph_id))).toBe(true);
+      expect(await service.delete("svc-1", "team-1", row.code_graph_id)).toBe(true);
+      await service.onIdle(row.code_graph_id);
+      expect(events).toEqual(["worker wrote directory", "metadata deleted"]);
+      expect(existsSync(service.dirFor("svc-1", "team-1", row.code_graph_id))).toBe(false);
+    } finally {
+      finishWorker();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("enqueues an admitted sync before a concurrent delete can inspect queue state", async () => {
+    const { row, store } = fixture("2026-01-01T00:00:00Z");
+    const root = mkdtempSync(join(tmpdir(), "knowledge-sync-delete-"));
+    let workerStarted!: () => void;
+    let finishWorker!: () => void;
+    const started = new Promise<void>((resolve) => { workerStarted = resolve; });
+    const blocked = new Promise<void>((resolve) => { finishWorker = resolve; });
+    const worker = vi.fn(async () => {
+      workerStarted();
+      await blocked;
+      return { commitHash: "new-commit" };
+    });
+    const service = new CodeGraphService({ store, dataRoot: root, worker });
+    try {
+      const syncing = service.sync("svc-1", "team-1", row.code_graph_id);
+      await started;
+      expect((await syncing).kind).toBe("ok");
+      const routes = createCodeGraphRoutes({ cgService: service, instancePool: {} as CodeGraphInstancePool, publicBaseUrl: "" });
+      const response = await routes.request("/delete", {
+        method: "POST", headers: { "content-type": "application/json", "x-tdai-service-id": "svc-1" },
+        body: JSON.stringify({ code_graph_ids: [row.code_graph_id] }),
+      });
+      expect((await response.json()).data.failed).toEqual([{ id: row.code_graph_id, reason: "busy" }]);
+      expect((await service.sync("svc-1", "team-1", row.code_graph_id)).kind).toBe("busy");
+      expect(store.deleteCodeGraph).not.toHaveBeenCalled();
+      finishWorker();
+      await service.onIdle(row.code_graph_id);
+      expect(store.getCodeGraphById("svc-1", row.code_graph_id)?.status).toBe("ready");
+      expect(await service.delete("svc-1", "team-1", row.code_graph_id)).toBe(true);
+      expect(worker).toHaveBeenCalledOnce();
+    } finally {
+      finishWorker();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("records a failed build if the first processing status write fails", async () => {
+    const { row, store } = fixture(null);
+    const originalUpdate = store.updateCodeGraphStatus.bind(store);
+    let failOnce = true;
+    store.updateCodeGraphStatus = (serviceId, id, patch) => {
+      if (patch.status === "processing" && failOnce) {
+        failOnce = false;
+        throw new Error("SQLite status write failed");
+      }
+      originalUpdate(serviceId, id, patch);
+    };
+    const worker = vi.fn(async () => ({}));
+    const service = new CodeGraphService({ store, dataRoot: "/unused", worker });
+    service.create({ service_id: "svc-1", team_id: "team-1", repo_url: row.repo_url, branch: "main" });
+    await service.onIdle("cg-1");
+    expect(worker).not.toHaveBeenCalled();
+    expect(row.status).toBe("failed");
+    expect(row.sync_error).toBe("SQLite status write failed");
   });
 });

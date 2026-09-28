@@ -142,6 +142,15 @@ describe.each(["direct", "tools"] as const)("CodeGraph %s query availability", (
     expect((await response.json()).error_code).toBe("CODE_GRAPH_INDEX_UNAVAILABLE");
     expect(deps.loadIfMissing).toHaveBeenCalledOnce();
   });
+
+  it("does not lazy-load an asset deleted after the route read its row", async () => {
+    const row = rowWith();
+    const deps = fixture(row, { loaded: false, lazyLoad: true });
+    deps.cgService.getById = vi.fn().mockReturnValueOnce(row).mockReturnValue(null);
+    const response = await query(route, deps);
+    expect(response.status).toBe(404);
+    expect(deps.loadIfMissing).not.toHaveBeenCalled();
+  });
 });
 
 describe("CodeGraph sync admission", () => {

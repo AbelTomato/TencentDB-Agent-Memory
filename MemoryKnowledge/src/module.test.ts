@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { createCodeGraphInstancePool } from "./module.js";
-import type { CodeGraphInstance } from "./engines/code/index.js";
+import { createCodeGraphInstancePool, createCodeGraphInstanceReleaser } from "./module.js";
+import { CodeGraphHandleCloseError, type CodeGraphInstance } from "./engines/code/index.js";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -109,5 +109,90 @@ describe("CodeGraph instance pool lifecycle gate", () => {
       { status: "rejected", reason: closeError },
     ]);
     expect(pool.get("graph")).toBeUndefined();
+  });
+
+  it("retries a discarded handle close on the next pause after one transient failure", async () => {
+    const opening = deferred<CodeGraphInstance>();
+    const discarded = instance("discarded");
+    const closeIndex = vi.fn()
+      .mockImplementationOnce(() => { throw new Error("transient close failure"); })
+      .mockImplementation(() => {});
+    const pool = createCodeGraphInstancePool({
+      openIndex: vi.fn(() => opening.promise), closeIndex,
+    });
+
+    const loading = pool.loadIfMissing("graph", "/old");
+    const firstPause = pool.pause("graph");
+    opening.resolve(discarded);
+    const results = await Promise.allSettled([loading, firstPause]);
+    expect(results.map((result) => result.status)).toEqual(["rejected", "rejected"]);
+    pool.resume("graph");
+
+    await expect(pool.pause("graph")).resolves.toBeUndefined();
+    expect(closeIndex).toHaveBeenCalledTimes(2);
+    expect(closeIndex).toHaveBeenNthCalledWith(2, discarded);
+    pool.resume("graph");
+  });
+
+  it("retains a partially opened lazy handle until deletion can close it", async () => {
+    const unclosed = instance("/old");
+    const openError = new CodeGraphHandleCloseError(
+      "open", new Error("handler failed"), new Error("first close failed"), unclosed.cg, "/old",
+    );
+    const close = vi.fn()
+      .mockImplementationOnce(() => { throw new Error("SQLite still busy"); })
+      .mockImplementation(() => {});
+    const pool = createCodeGraphInstancePool({
+      openIndex: vi.fn().mockRejectedValue(openError), closeIndex: close,
+    });
+    const releaseInstance = createCodeGraphInstanceReleaser(pool, close);
+
+    expect(await pool.loadIfMissing("graph", "/old")).toBeUndefined();
+    expect(await pool.loadIfMissing("graph", "/old")).toBeUndefined();
+    await expect(releaseInstance("graph")).rejects.toBe(openError);
+    await expect(releaseInstance("graph")).rejects.toThrow("SQLite still busy");
+    const resume = await releaseInstance("graph");
+    expect(close).toHaveBeenCalledTimes(2);
+    expect(resume).not.toBeNull();
+    resume?.();
+  });
+
+  it("rejects deletion immediately while a query lease is active, then holds the gate", async () => {
+    const old = instance("old");
+    const closeIndex = vi.fn();
+    const pool = createCodeGraphInstancePool({ openIndex: vi.fn(async () => old), closeIndex });
+    pool.set("graph", old);
+    const lease = pool.acquire("graph")!;
+    const releaseInstance = createCodeGraphInstanceReleaser(pool, closeIndex);
+    expect(await releaseInstance("graph")).toBeNull();
+    expect(closeIndex).not.toHaveBeenCalled();
+
+    lease.release();
+    const resume = await releaseInstance("graph");
+    expect(resume).not.toBeNull();
+    expect(closeIndex).toHaveBeenCalledExactlyOnceWith(old);
+    expect(pool.get("graph")).toBeUndefined();
+    expect(pool.acquire("graph")).toBeUndefined();
+    expect(await pool.loadIfMissing("graph", "/old")).toBeUndefined();
+    resume?.();
+    resume?.();
+  });
+
+  it("retains a failed-close handle and retries closing it before deletion", async () => {
+    const old = instance("old");
+    const closeError = new Error("SQLite close failed");
+    const pool = createCodeGraphInstancePool({ openIndex: vi.fn(async () => old), closeIndex: vi.fn() });
+    pool.set("graph", old);
+    const close = vi.fn().mockImplementationOnce(() => { throw closeError; });
+    const releaseInstance = createCodeGraphInstanceReleaser(pool, close);
+
+    await expect(releaseInstance("graph")).rejects.toBe(closeError);
+    expect(pool.get("graph")).toBe(old);
+
+    const resume = await releaseInstance("graph");
+    expect(close).toHaveBeenCalledTimes(2);
+    expect(close).toHaveBeenNthCalledWith(2, old);
+    expect(pool.get("graph")).toBeUndefined();
+    resume?.();
   });
 });

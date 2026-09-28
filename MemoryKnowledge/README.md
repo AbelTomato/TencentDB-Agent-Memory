@@ -30,7 +30,9 @@
 
 并发调用 `POST /v3/code-graph/sync` 时，已在构建的资产仍返回 409 `busy`；跨进程同步准入冲突返回 409 和 `CODE_GRAPH_SYNC_CONFLICT`，调用方可重新读取资产状态。
 
-每组 `KNOWLEDGE_DATA_DIR` 与 `KNOWLEDGE_DB_PATH` 当前由一个 MemoryKnowledge 进程独占。同步准入用 SQLite 原子更新阻止两个请求同时启动同一资产，但 `BuildQueue`、目录晋升和启动恢复仍按单进程所有权设计；不要让多个实例同时维护同一数据根。多副本部署需要独立数据根，或先实现跨进程构建租约与恢复仲裁。
+每个 `KNOWLEDGE_DATA_DIR` 和 `KNOWLEDGE_DB_PATH` 只能由一个 MemoryKnowledge 进程使用。服务启动时分别取得数据根和元数据库的进程锁；若另一进程已持有其中任一锁，新进程启动失败。进程退出（包括意外终止）后，操作系统释放锁，下一次启动才会执行中断恢复。锁文件位于数据根的 `.memoryknowledge-owner.sqlite` 和元数据库旁的 `<数据库文件>.memoryknowledge-owner.sqlite`；它们只用于所有权协调。元数据库路径不能是符号链接或硬链接，以免别名绕过所有权锁。同步准入仍使用 SQLite 原子更新，阻止并发请求重复入队。多副本部署需要每个副本拥有独立的数据根和元数据库；共享存储多副本模式尚不支持。
+
+如果启动恢复无法确认哪个索引快照已提交，资产会标记为 `failed` 并保留规范目录及 `.previous`、`.suspect` 目录供排查。此时应先备份这些目录，核对 Git HEAD、索引数据库与元数据中的提交记录，再决定如何恢复；带有未决备份目录的资产会拒绝直接 `sync`，避免覆盖可能是唯一可用的快照。
 
 单独 `pnpm dev` 可以起服务；产品链路里必须有 Panel 推 `llm_binding`、收 callback、写远端元数据。
 

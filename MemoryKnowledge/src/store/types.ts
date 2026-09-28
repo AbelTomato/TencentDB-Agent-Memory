@@ -240,7 +240,7 @@ export interface IKnowledgeStore {
   listCodeGraphAudit(serviceId: string, codeGraphId: string, limit?: number, offset?: number): AuditLogRow[];
 
   // ── Restart recovery ──
-  /** Incomplete or failed refreshes with has_last_good=true. */
+  /** Non-ready code graphs; recovery decides whether disk snapshots are trustworthy. */
   listRecoverableCodeGraphs(): CodeGraphRow[];
   /** Sweep all non-terminal (pending/processing) assets to failed, across all tenants. */
   markInterruptedAsFailed(reason?: string): number;

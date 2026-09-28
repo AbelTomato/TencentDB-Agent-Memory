@@ -399,7 +399,7 @@ type CodeGraphQueryLease = {
   release: () => void;
 };
 
-type CodeGraphQueryAccess = { lease: CodeGraphQueryLease } | { response: Response };
+type CodeGraphQueryAccess = { lease: CodeGraphQueryLease; row: CodeGraphRow } | { response: Response };
 
 /** Temporary gaps during a refresh are retryable; a failed first build is not. */
 function codeGraphQueryUnavailable(errorCode: string, message: string, retryable: boolean): Response {
@@ -427,6 +427,15 @@ export async function resolveCodeGraphQueryAccess(
 ): Promise<CodeGraphQueryAccess> {
   const { code_graph_id: codeGraphId, team_id: teamId } = row;
 
+  // The route may have read a ready row just before a delete committed. Do
+  // not lazy-open a directory from that stale snapshot, especially when file
+  // cleanup is still running or awaiting retry.
+  const current = cgService.getById(serviceId, codeGraphId);
+  if (!current || cgService.hasPendingCleanup?.(serviceId, codeGraphId)) {
+    return { response: Response.json(wrapError(404, "code graph not found"), { status: 404 }) };
+  }
+  row = current;
+
   if (row.status === "failed") {
     // A failed state does not prove the old index survived a rollback.
     return { response: codeGraphQueryUnavailable("CODE_GRAPH_INDEX_FAILED", "code graph index failed", false) };
@@ -443,7 +452,7 @@ export async function resolveCodeGraphQueryAccess(
     }
     const lease = acquireCodeGraphLease(instancePool, codeGraphId);
     return lease
-      ? { lease }
+      ? { lease, row }
       : { response: codeGraphQueryUnavailable("CODE_GRAPH_INDEX_UNAVAILABLE", "code graph previous index is not loaded", true) };
   }
 
@@ -458,7 +467,7 @@ export async function resolveCodeGraphQueryAccess(
     lease = acquireCodeGraphLease(instancePool, codeGraphId);
   }
   return lease
-    ? { lease }
+    ? { lease, row }
     : { response: codeGraphQueryUnavailable("CODE_GRAPH_INDEX_UNAVAILABLE", "code graph instance not loaded", true) };
 }
 
@@ -506,7 +515,7 @@ async function executeCodeGraphTool(
   if ("response" in access) return access.response;
   try {
     const result = await executeCodeTool(access.lease.instance, cgToolName, toolParams);
-    return Response.json(wrapOk(codeGraphQueryResult(row, result)), { status: result.isError ? 500 : 200 });
+    return Response.json(wrapOk(codeGraphQueryResult(access.row, result)), { status: result.isError ? 500 : 200 });
   } finally {
     access.lease.release();
   }

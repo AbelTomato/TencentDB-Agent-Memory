@@ -235,6 +235,10 @@ export class SqliteKnowledgeStore implements IKnowledgeStore {
         status: "pending",
         internalStatus: null,
         syncError: null,
+        // A failed row only proves that a last-good build existed sometime in
+        // the past. Its current canonical directory may be an uncommitted
+        // candidate, so a retry must not expose it to pending-state queries.
+        hasLastGood: sql`CASE WHEN ${knowledgeCodeGraph.status} = 'ready' THEN ${knowledgeCodeGraph.hasLastGood} ELSE 0 END`,
         version: sql`${knowledgeCodeGraph.version} + 1`,
         updatedAt: nowIso(),
       })
@@ -569,7 +573,6 @@ export class SqliteKnowledgeStore implements IKnowledgeStore {
       .from(knowledgeCodeGraph)
       .where(and(
         sql`status IN ('pending','processing','failed')`,
-        eq(knowledgeCodeGraph.hasLastGood, true),
         isNull(knowledgeCodeGraph.deletedAt),
       ))
       .all()

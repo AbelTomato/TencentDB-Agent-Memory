@@ -309,11 +309,15 @@ export function createCodeGraphRoutes(deps: CodeGraphRouteDeps): Hono {
         continue;
       }
       const row = cgService.getById(serviceId, id);
-      if (!row) {
+      if (!row && !cgService.hasPendingCleanup(serviceId, id)) {
         result.failed.push({ id, reason: "not found" });
         continue;
       }
-      const ok = cgService.delete(serviceId, row.team_id, id);
+      if (cgService.isBuildBusy(id)) {
+        result.failed.push({ id, reason: "busy" });
+        continue;
+      }
+      const ok = await cgService.deleteById(serviceId, id);
       if (ok) {
         // instance pool 释放已由 service.cleanupResources(releaseInstance) 统一处理。
         result.deleted_ids.push(id);
@@ -353,7 +357,7 @@ export function createCodeGraphRoutes(deps: CodeGraphRouteDeps): Hono {
       if ("response" in access) return access.response;
       try {
         const result = await executeCodeTool(access.lease.instance, toolName, built.params);
-        return c.json(wrapOk(codeGraphQueryResult(row, result)), result.isError ? 500 : 200);
+        return c.json(wrapOk(codeGraphQueryResult(access.row, result)), result.isError ? 500 : 200);
       } finally {
         access.lease.release();
       }

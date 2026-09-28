@@ -20,10 +20,11 @@ import {
   type ILlmBindingStore,
 } from "./store/llm-binding-store.js";
 import { createWikiSourceManager, type WikiSourceManager } from "./engines/wiki/index.js";
-import { openIndex, getStats, closeIndex, type CodeGraphInstance } from "./engines/code/index.js";
+import { CodeGraphHandleCloseError, openIndex, getStats, closeIndex, type CodeGraphInstance } from "./engines/code/index.js";
 import { SourceFetcherRegistry } from "./source-fetcher/index.js";
 import { createCodeGraphWorker } from "./code-graph-worker.js";
 import { recoverInterruptedCodeGraphs } from "./code-graph-recovery.js";
+import { acquireDataRootOwnership, acquireKnowledgeStoreOwnership, type DataRootOwnership } from "./data-root-ownership.js";
 import { createLogger } from "./logger.js";
 import type { LlmConfig } from "./config.js";
 import { getGlobalLlmConcurrency } from "./config.js";
@@ -40,6 +41,10 @@ export const globalLlmLimit = pLimit(getGlobalLlmConcurrency());
 export interface KnowledgeModuleConfig {
   dataDir: string;
   db: Db;
+  /** Path of the metadata database; required to guard external DB paths. */
+  dbPath?: string;
+  /** Acquired before opening the metadata DB when constructed by the server. */
+  dataRootOwnership?: DataRootOwnership;
   /** LLM configuration for wiki ingest. */
   llmConfig: LlmConfig;
   /** TMC callback URL for status notifications (empty = no callback). */
@@ -58,6 +63,10 @@ export interface CodeGraphInstancePool {
   acquire?(codeGraphId: string): { instance: CodeGraphInstance; release(): void } | undefined;
   /** Stop new leases and lazy loads, then wait for existing ones to finish. */
   pause?(codeGraphId: string): Promise<void>;
+  /** Acquire an exclusive pause immediately, or report an active reader. */
+  tryPause?(codeGraphId: string): boolean;
+  /** Retain an unclosed candidate handle so delete also drains it before rm. */
+  retainUnclosed?(codeGraphId: string, instance: CodeGraphInstance, onClosed?: () => void): void;
   resume?(codeGraphId: string): void;
   loadIfMissing?(codeGraphId: string, dir: string): Promise<CodeGraphInstance | undefined>;
 }
@@ -72,8 +81,10 @@ interface CodeGraphPoolGate {
   leases: number;
   loads: number;
   waiters: Array<{ resolve: () => void; reject: (error: unknown) => void }>;
-  /** A discarded handle could not be closed, so promotion cannot safely proceed. */
+  /** A discarded handle could not be closed during the current drain. */
   drainError?: unknown;
+  /** Keep failed closes reachable so a later pause can retry before copying. */
+  retired: Map<CodeGraphInstance, (() => void) | undefined>;
 }
 
 /** The production pool's lifecycle gate protects handles while a graph is promoted. */
@@ -87,16 +98,41 @@ export function createCodeGraphInstancePool(
   function gate(id: string) {
     let state = gates.get(id);
     if (!state) {
-      state = { pauses: 0, leases: 0, loads: 0, waiters: [] };
+      state = { pauses: 0, leases: 0, loads: 0, waiters: [], retired: new Map() };
       gates.set(id, state);
     }
     return state;
   }
 
+  function retryRetired(state: CodeGraphPoolGate): void {
+    for (const [instance, onClosed] of state.retired) {
+      indexOps.closeIndex(instance);
+      state.retired.delete(instance);
+      onClosed?.();
+    }
+  }
+
+  function maybeDeleteGate(id: string, state: CodeGraphPoolGate): void {
+    if (!instances.has(id) && !loading.has(id) && state.pauses === 0 && state.leases === 0 &&
+        state.loads === 0 && state.waiters.length === 0 && state.retired.size === 0) {
+      gates.delete(id);
+    }
+  }
+
   function notifyIdle(state: CodeGraphPoolGate) {
     if (state.leases !== 0 || state.loads !== 0) return;
-    for (const waiter of state.waiters.splice(0)) {
-      if (state.drainError !== undefined) waiter.reject(state.drainError);
+    const waiters = state.waiters.splice(0);
+    if (waiters.length === 0) return;
+    // A close failure invalidates this drain, but must not poison every future
+    // refresh. Retain the handle and retry its close on the next pause.
+    let failure = state.drainError;
+    state.drainError = undefined;
+    if (failure === undefined) {
+      try { retryRetired(state); }
+      catch (err) { failure = err; }
+    }
+    for (const waiter of waiters) {
+      if (failure !== undefined) waiter.reject(failure);
       else waiter.resolve();
     }
   }
@@ -104,6 +140,7 @@ export function createCodeGraphInstancePool(
   function discard(state: CodeGraphPoolGate, instance: CodeGraphInstance) {
     try { indexOps.closeIndex(instance); }
     catch (err) {
+      state.retired.set(instance, undefined);
       state.drainError = err;
       throw err;
     }
@@ -111,8 +148,15 @@ export function createCodeGraphInstancePool(
 
   return {
     get(id) { return instances.get(id); },
+    retainUnclosed(id, instance, onClosed) {
+      gate(id).retired.set(instance, onClosed);
+    },
     set(id, instance) { instances.set(id, instance); },
-    delete(id) { instances.delete(id); },
+    delete(id) {
+      instances.delete(id);
+      const state = gates.get(id);
+      if (state) maybeDeleteGate(id, state);
+    },
     acquire(id) {
       const state = gate(id);
       if (state.pauses > 0) return undefined;
@@ -127,6 +171,7 @@ export function createCodeGraphInstancePool(
           released = true;
           state.leases--;
           notifyIdle(state);
+          maybeDeleteGate(id, state);
         },
       };
     },
@@ -135,17 +180,39 @@ export function createCodeGraphInstancePool(
       // Mark paused synchronously, before the caller's first await.
       state.pauses++;
       if (state.leases === 0 && state.loads === 0) {
-        return state.drainError !== undefined ? Promise.reject(state.drainError) : Promise.resolve();
+        const failure = state.drainError;
+        state.drainError = undefined;
+        if (failure !== undefined) return Promise.reject(failure);
+        try { retryRetired(state); }
+        catch (err) { return Promise.reject(err); }
+        return Promise.resolve();
       }
       return new Promise<void>((resolve, reject) => { state.waiters.push({ resolve, reject }); });
+    },
+    tryPause(id) {
+      const state = gate(id);
+      if (state.pauses > 0 || state.leases > 0 || state.loads > 0) return false;
+      state.pauses++;
+      try {
+        const failure = state.drainError;
+        state.drainError = undefined;
+        if (failure !== undefined) throw failure;
+        retryRetired(state);
+        return true;
+      } catch (err) {
+        state.pauses--;
+        maybeDeleteGate(id, state);
+        throw err;
+      }
     },
     resume(id) {
       const state = gate(id);
       if (state.pauses > 0) state.pauses--;
+      maybeDeleteGate(id, state);
     },
     async loadIfMissing(id, dir) {
       const state = gate(id);
-      if (state.pauses > 0) return undefined;
+      if (state.pauses > 0 || state.retired.size > 0) return undefined;
       const existing = instances.get(id);
       if (existing) return existing;
       const pending = loading.get(id);
@@ -157,6 +224,12 @@ export function createCodeGraphInstancePool(
           let instance: CodeGraphInstance;
           try { instance = await indexOps.openIndex(dir); }
           catch (err) {
+            if (err instanceof CodeGraphHandleCloseError) {
+              // A partially opened SQLite handle survived a failed close.
+              // Keep it reachable so delete/refresh cannot move its files.
+              state.retired.set(err.unclosedInstance, undefined);
+              state.drainError = err;
+            }
             log.warn(`[code-graph] lazy-load failed ${id}: ${err instanceof Error ? err.message : String(err)}`);
             return undefined;
           }
@@ -177,6 +250,7 @@ export function createCodeGraphInstancePool(
           loading.delete(id);
           state.loads--;
           notifyIdle(state);
+          maybeDeleteGate(id, state);
         }
       })();
       loading.set(id, opening);
@@ -185,7 +259,37 @@ export function createCodeGraphInstancePool(
   };
 }
 
+/** Drain readers and lazy opens, then hold the gate through metadata/file deletion. */
+export function createCodeGraphInstanceReleaser(
+  instancePool: Required<CodeGraphInstancePool>,
+  close: (instance: CodeGraphInstance) => void = closeIndex,
+): (codeGraphId: string) => Promise<(() => void) | null> {
+  return async (codeGraphId) => {
+    let paused = false;
+    try {
+      paused = instancePool.tryPause(codeGraphId);
+      if (!paused) return null;
+      const inst = instancePool.get(codeGraphId);
+      // Keep a handle whose close failed reachable. A later delete can retry
+      // closing it; dropping the pool entry would let that retry unlink an
+      // index while SQLite may still hold its WAL and database files open.
+      if (inst) close(inst);
+      instancePool.delete(codeGraphId);
+      let resumed = false;
+      return () => {
+        if (resumed) return;
+        resumed = true;
+        instancePool.resume(codeGraphId);
+      };
+    } catch (err) {
+      if (paused) instancePool.resume(codeGraphId);
+      throw err;
+    }
+  };
+}
+
 export interface KnowledgeModule {
+  dataRootOwnership: DataRootOwnership;
   wikiService: WikiService;
   cgService: CodeGraphService;
   wikiMgr: WikiSourceManager;
@@ -206,6 +310,17 @@ export interface KnowledgeModule {
  * - Async restore synced instances
  */
 export function createKnowledgeModule(config: KnowledgeModuleConfig): KnowledgeModule {
+  const ownership = config.dataRootOwnership ?? (config.dbPath
+    ? acquireKnowledgeStoreOwnership(config.dataDir, config.dbPath)
+    : acquireDataRootOwnership(config.dataDir));
+  try { return buildKnowledgeModule(config, ownership); }
+  catch (err) {
+    if (!config.dataRootOwnership) ownership.release();
+    throw err;
+  }
+}
+
+function buildKnowledgeModule(config: KnowledgeModuleConfig, ownership: DataRootOwnership): KnowledgeModule {
   const { dataDir, db, llmConfig } = config;
 
   // Store
@@ -287,12 +402,7 @@ export function createKnowledgeModule(config: KnowledgeModuleConfig): KnowledgeM
     queue: sharedQueue,
     logger: { info: log.info.bind(log), warn: log.warn.bind(log), error: log.error.bind(log) },
     callbackConfig,
-    // 释放 code-graph 内存资源（008 delete 清理）：从 pool 移除并关闭索引句柄。幂等。
-    releaseInstance: (codeGraphId: string) => {
-      const inst = instancePool.get(codeGraphId);
-      if (inst) closeIndex(inst);
-      instancePool.delete(codeGraphId);
-    },
+    releaseInstance: createCodeGraphInstanceReleaser(instancePool),
   });
 
   // A refresh still has a last-good index; an initial build does not.
@@ -361,5 +471,5 @@ export function createKnowledgeModule(config: KnowledgeModuleConfig): KnowledgeM
   });
   autoSyncScheduler.start();
 
-  return { wikiService, cgService, wikiMgr, store, instancePool, llmBindingStore, autoSyncScheduler, autoSyncConfig };
+  return { dataRootOwnership: ownership, wikiService, cgService, wikiMgr, store, instancePool, llmBindingStore, autoSyncScheduler, autoSyncConfig };
 }
